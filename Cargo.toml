@@ -7,7 +7,7 @@ authors = ["Paul Yu <paul.yu@coreon.ai>"]
 license = "MIT"
 repository = "https://github.com/yhc007/gsea"
 keywords = ["llm", "agent", "memory", "rust", "evolution"]
-categories = ["command-line-utilities", "development-tools", "ai"]
+categories = ["command-line-utilities", "development-tools"]
 exclude = ["memory/*.db", "sessions/*.json", "evolution_sandbox/*"]
 
 [dependencies]
