@@ -144,6 +144,23 @@ impl Brain {
         self.procedural.get_skill_code(name)
     }
 
+    /// Learn: store a new piece of information as a semantic memory.
+    /// Returns the memory ID for later reference.
+    pub fn learn(&self, content: &str) -> Result<UuidValue, anyhow::Error> {
+        let item = MemoryItem::new(content, MemoryType::Semantic);
+        let id = item.id;
+        self.semantic.store(item)?;
+        Ok(id)
+    }
+
+    /// Forget: delete a memory by its UUID from all storage types.
+    pub fn forget(&self, id: &str) -> Result<(), anyhow::Error> {
+        let _ = self.episodic.delete(id);
+        let _ = self.semantic.delete(id);
+        let _ = self.procedural.delete(id);
+        Ok(())
+    }
+
     /// Search across all memory types by embedding similarity.
     pub fn recall_by_similarity(&self, query_emb: &[f32], limit: usize, min_score: f64) -> Vec<(MemoryItem, f64)> {
         let mut results = Vec::new();

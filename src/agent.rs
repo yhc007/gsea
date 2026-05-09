@@ -11,16 +11,21 @@ use crate::tools::{ToolRegistry, skill_tools};
 /// and memory logging.
 pub struct Agent {
     llm: OllamaClient,
+    fast_llm: OllamaClient,
     brain: Arc<std::sync::Mutex<Brain>>,
     pub tools: Arc<std::sync::Mutex<ToolRegistry>>,
     embedder: Arc<dyn EmbeddingEngine>,
     session_id: String,
+    /// User-facing conversation history (uses llm)
     messages: Vec<Message>,
+    /// Fast model conversation history (uses fast_llm, for evolution)
+    fast_messages: Vec<Message>,
 }
 
 impl Agent {
     pub fn new(
         llm: OllamaClient,
+        fast_llm: OllamaClient,
         brain: Arc<std::sync::Mutex<Brain>>,
         tools: Arc<std::sync::Mutex<ToolRegistry>>,
         embedder: Arc<dyn EmbeddingEngine>,
@@ -39,8 +44,13 @@ impl Agent {
             Self::build_system_prompt(&reg, &b)
         };
 
+        let fast_system = String::from(
+            "You are GSEA's fast assistant for evolution and utility tasks. Respond concisely."
+        );
+
         Self {
             llm,
+            fast_llm,
             brain,
             tools,
             embedder,
@@ -49,7 +59,28 @@ impl Agent {
                 role: "system".to_string(),
                 content: system_prompt,
             }],
+            fast_messages: vec![Message {
+                role: "system".to_string(),
+                content: fast_system,
+            }],
         }
+    }
+
+    /// Process a message using the fast model (qwen3:8b).
+    /// Used by EvolutionEngine for self-review and code generation.
+    pub async fn process_message_fast(&mut self, prompt: &str) -> Result<String> {
+        self.fast_messages.push(Message {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        });
+
+        let response = self
+            .fast_llm
+            .chat(self.fast_messages.clone())
+            .await?;
+
+        self.fast_messages.push(response.clone());
+        Ok(response.content)
     }
 
     fn build_system_prompt(tools: &ToolRegistry, brain: &Brain) -> String {

@@ -29,8 +29,8 @@ use tools::{
 #[derive(Parser)]
 #[command(name = "gsea", version, about = "Gemma Self-Evolving Agent")]
 struct Cli {
-    /// The Gemma model to use (must be available in Ollama)
-    #[arg(short, long, default_value = "gemma4:26b")]
+    /// Main model (gemma4:26b for complex tasks, qwen3:8b for fast response)
+    #[arg(short, long, default_value = "qwen3:8b")]
     model: String,
 
     /// Ollama base URL
@@ -40,6 +40,10 @@ struct Cli {
     /// Path to the MemoryBrain SQLite database
     #[arg(short = 'd', long, default_value = "memory")]
     db_path: String,
+
+    /// Fast model for evolution cycles and simple tasks
+    #[arg(long, default_value = "qwen3:8b")]
+    fast_model: String,
 
     /// Embedding model for semantic memory search
     #[arg(short = 'e', long, default_value = "nomic-embed-text")]
@@ -73,8 +77,10 @@ async fn main() -> Result<()> {
     let brain = Arc::new(std::sync::Mutex::new(Brain::new(&cli.db_path)?));
     tracing::info!("Brain initialized at {}", cli.db_path);
 
-    // Initialize Ollama client
+    // Initialize Ollama clients (main + fast)
     let llm = OllamaClient::new(&cli.ollama_url, &cli.model);
+    let fast_llm = OllamaClient::new(&cli.ollama_url, &cli.fast_model);
+    tracing::info!("Main model: {}, Fast model: {}", cli.model, cli.fast_model);
 
     // Initialize embedding engine
     let embedder: Arc<dyn EmbeddingEngine> = Arc::new(OllamaEmbedder::new(
@@ -105,8 +111,8 @@ async fn main() -> Result<()> {
         registry.lock().unwrap().list_tools().len()
     );
 
-    // Create agent
-    let mut agent = Agent::new(llm, brain.clone(), registry.clone(), embedder);
+    // Create agent (with fast model for evolution)
+    let mut agent = Agent::new(llm, fast_llm, brain.clone(), registry.clone(), embedder);
 
     // Create evolution engine
     let mut evolution = EvolutionEngine::new(brain.clone(), registry.clone(), cli.reflect_interval);
@@ -154,7 +160,8 @@ async fn run_interactive(
     agent: &mut Agent,
     evolution: &mut EvolutionEngine,
 ) -> Result<()> {
-    println!("GSEA Interactive Mode (type 'exit' to quit, '/reflect' for manual reflection)");
+    println!("GSEA Interactive Mode");
+    println!("  Type /help for available commands");
     println!("{}", "─".repeat(50));
 
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -180,6 +187,40 @@ async fn run_interactive(
                         let brain = evolution.brain.lock().unwrap();
                         let stats = brain.stats();
                         println!("{}", serde_json::to_string_pretty(&stats)?);
+                        continue;
+                    }
+                    "/help" => {
+                        println!("Commands:");
+                        println!("  /learn <text>   Store information in long-term memory");
+                        println!("  /forget <id>    Delete a memory by its UUID");
+                        println!("  /tools          List all registered tools");
+                        println!("  /stats          Show memory statistics");
+                        println!("  /reflect        Run a self-evolution reflection cycle");
+                        println!("  exit, quit      Exit");
+                        continue;
+                    }
+                    "/tools" => {
+                        let reg = agent.tools.lock().unwrap();
+                        println!("Registered tools ({}):", reg.list_tools().len());
+                        println!("{}", reg.tool_description_text());
+                        continue;
+                    }
+                    s if s.starts_with("/forget ") => {
+                        let id = s.trim_start_matches("/forget ").trim();
+                        let brain = evolution.brain.lock().unwrap();
+                        match brain.forget(id) {
+                            Ok(_) => println!("Forgotten: {}", id),
+                            Err(e) => println!("Error: {}", e),
+                        }
+                        continue;
+                    }
+                    s if s.starts_with("/learn ") => {
+                        let content = s.trim_start_matches("/learn ").trim();
+                        let brain = evolution.brain.lock().unwrap();
+                        match brain.learn(content) {
+                            Ok(id) => println!("✅ Learned (id: {})", id),
+                            Err(e) => println!("Error: {}", e),
+                        }
                         continue;
                     }
                     "" => continue,

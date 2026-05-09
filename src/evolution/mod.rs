@@ -75,8 +75,8 @@ Current system state:
         );
 
         let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(45),
-            agent.process_message(&code_prompt),
+            std::time::Duration::from_secs(30),
+            agent.process_message_fast(&code_prompt),
         )
         .await
         {

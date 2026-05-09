@@ -13,6 +13,11 @@ impl ProceduralMemory {
         })
     }
 
+    pub fn delete(&self, id: &str) -> Result<()> {
+        self.storage.delete(id)?;
+        Ok(())
+    }
+
     pub fn store(&self, item: MemoryItem) -> Result<()> {
         self.storage.insert(item)?;
         Ok(())

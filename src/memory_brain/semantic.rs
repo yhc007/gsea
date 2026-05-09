@@ -12,6 +12,11 @@ impl SemanticMemory {
         })
     }
 
+    pub fn delete(&self, id: &str) -> Result<(), anyhow::Error> {
+        self.storage.delete(id)?;
+        Ok(())
+    }
+
     pub fn store(&self, item: MemoryItem) -> Result<(), anyhow::Error> {
         self.storage.insert(item)?;
         Ok(())

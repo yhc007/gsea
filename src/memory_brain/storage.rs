@@ -155,6 +155,14 @@ impl Storage {
         Ok(())
     }
 
+    /// Delete a memory by its UUID string.
+    pub fn delete(&self, id: &str) -> Result<(), anyhow::Error> {
+        let sql = format!("DELETE FROM {} WHERE id = ?1", self.table);
+        let guard = self.conn.lock().unwrap();
+        guard.execute(&sql, rusqlite::params![id])?;
+        Ok(())
+    }
+
     /// Search memories by embedding similarity (cosine).
     /// Returns (MemoryItem, score) sorted by descending similarity.
     pub fn search_by_embedding(
