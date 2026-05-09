@@ -1,0 +1,41 @@
+[package]
+name = "gsea"
+version = "0.1.0"
+edition = "2021"
+description = "Gemma Self-Evolving Agent — local LLM agent with persistent MemoryBrain"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for Ollama API
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# SQLite for MemoryBrain
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async trait
+async-trait = "0.1"
+
+# UUID for session IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Interactive REPL
+rustyline = "14"
+
+# TTY detection
+atty = "0.2"
