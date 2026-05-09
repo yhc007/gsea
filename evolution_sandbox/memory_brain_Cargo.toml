@@ -1,0 +1,85 @@
+[package]
+name = "memory-brain"
+version = "0.1.0"
+edition = "2021"
+description = "Human brain-inspired memory system for LLMs"
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Database - CoreDB (Cassandra-style NoSQL)
+coredb = { path = "../coredb" }
+
+# Vector search (lightweight, pure Rust)
+hora = "0.1"
+
+# HNSW for fast approximate nearest neighbors
+hnsw = "0.11"
+space = "0.17"
+rand = "0.8"
+rand_pcg = "0.3"
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# HTTP server
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID for memory IDs
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Async trait for SemanticStore
+async-trait = "0.1"
+
+# Error handling
+anyhow = "1.0"
+
+# LRU cache for embeddings
+lru = "0.12"
+
+# Regex for search
+regex = "1.10"
+
+# TUI visualization
+colored = "2.1"
+ratatui = "0.29"
+crossterm = "0.28"
+
+# (CoreDB is now required, not optional)
+
+# Directory paths
+dirs = "6.0"
+
+# Actor-based memory system (CLS)
+memory-actor = { path = "crates/memory-actor" }
+
+# MLX for embeddings (optional)
+mlx-rs = { path = "../MLX/mlx-rs", optional = true }
+
+# CLIP/Vision (optional)
+ort = { version = "2.0.0-rc.11", optional = true }
+image = { version = "0.25", optional = true }
+hex = "0.4"
+urlencoding = "2.1"
+
+# HTTP client for CLIP server and Ollama VLM
+ureq = { version = "2.9", features = ["json"] }
+
+# Base64 encoding for VLM image upload
+base64 = "0.22"
+
+[features]
+default = []
+mlx = ["mlx-rs"]
+clip = ["ort", "image"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.10"
+tower = "0.5"

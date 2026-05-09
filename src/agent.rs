@@ -1,17 +1,17 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Instant;
+
 
 use crate::llm::{embedding::EmbeddingEngine, Message, OllamaClient};
-use crate::memory_brain::MemoryBrain;
+use crate::memory_brain::Brain;
 use crate::tools::ToolRegistry;
 
 /// The core agent loop. Manages conversation with Gemma, tool execution,
-/// and MemoryBrain logging.
+/// and memory logging.
 pub struct Agent {
     llm: OllamaClient,
-    brain: Arc<MemoryBrain>,
+    brain: Arc<std::sync::Mutex<Brain>>,
     tools: ToolRegistry,
     embedder: Arc<dyn EmbeddingEngine>,
     session_id: String,
@@ -21,7 +21,7 @@ pub struct Agent {
 impl Agent {
     pub fn new(
         llm: OllamaClient,
-        brain: Arc<MemoryBrain>,
+        brain: Arc<std::sync::Mutex<Brain>>,
         tools: ToolRegistry,
         embedder: Arc<dyn EmbeddingEngine>,
     ) -> Self {
@@ -72,37 +72,25 @@ When you're done, provide a final response to the user."#,
 
     /// Process a single user message — the core agent loop.
     pub async fn process_message(&mut self, user_input: &str) -> Result<String> {
-        let start = Instant::now();
-
-        // 1. Recall relevant memories via embedding similarity
-        let memory_context = match self.embedder.embed(user_input).await {
-            Ok(query_emb) => {
-                let memories = self.brain.search_by_similarity(&query_emb, 5, 0.4)?;
-                if !memories.is_empty() {
-                    let lines: Vec<String> = memories
-                        .into_iter()
-                        .map(|(_, content, ctype, score)| {
-                            format!("[{}] (score: {:.2}) {}", ctype, score, &content[..content.len().min(200)])
-                        })
-                        .collect();
-                    format!("\nRelevant memories:\n{}\n", lines.join("\n"))
-                } else {
-                    String::new()
-                }
-            }
-            Err(_) => {
-                // Fallback to keyword search
-                let memories = self.brain.search_memories(user_input, 5)?;
-                if !memories.is_empty() {
-                    let lines: Vec<String> = memories
-                        .iter()
-                        .map(|(_, content, ctype, _)| format!("[{}] {}", ctype, content))
-                        .collect();
-                    format!("\nRelevant memories:\n{}\n", lines.join("\n"))
-                } else {
-                    String::new()
-                }
-            }
+        // 1. Recall relevant memories
+        let memories = {
+            let brain = self.brain.lock().unwrap();
+            brain.recall(user_input, 5)
+        };
+        let memory_context = if !memories.is_empty() {
+            let lines: Vec<String> = memories
+                .iter()
+                .map(|item| {
+                    format!(
+                        "[{}] (strength: {:.2}) {}",
+                        item.memory_type, item.strength,
+                        &item.content[..item.content.len().min(200)]
+                    )
+                })
+                .collect();
+            format!("\nRelevant memories:\n{}\n", lines.join("\n"))
+        } else {
+            String::new()
         };
 
         // 2. Build the augmented prompt
@@ -136,18 +124,12 @@ When you're done, provide a final response to the user."#,
             response_content
         };
 
-        // 5. Store in episodic memory
-        let elapsed = start.elapsed().as_millis() as i64;
-        self.brain.record_episode(
-            &self.session_id,
-            user_input,
-            Some(&final_output),
-            None,
-            "success",
-            0,
-            elapsed,
-            None,
-        )?;
+        // 5. Store in memory
+        {
+            let mut brain = self.brain.lock().unwrap();
+            let content = format!("User: {}\nAssistant: {}", user_input, &final_output[..final_output.len().min(300)]);
+            brain.process(&content, Some(crate::memory_brain::MemoryType::Episodic))?;
+        }
 
         Ok(final_output)
     }
@@ -229,7 +211,10 @@ When you're done, provide a final response to the user."#,
 
     /// Run a reflection cycle: ask Gemma to review recent activity and generate improvements.
     pub async fn run_reflection_cycle(&mut self) -> Result<String> {
-        let summary = self.brain.generate_context_summary()?;
+        let summary = {
+            let brain = self.brain.lock().unwrap();
+            brain.generate_context_summary()
+        };
 
         let reflection_prompt = format!(
             r#"Self-Reflection Cycle
@@ -259,12 +244,10 @@ describe the exact code changes needed."#,
         self.messages.push(response.clone());
 
         // Record the reflection
-        self.brain.record_reflection(
-            "scheduled_reflection",
-            &response.content,
-            None,
-            None,
-        )?;
+        {
+            let mut brain = self.brain.lock().unwrap();
+            brain.record_reflection("scheduled_reflection", &response.content)?;
+        }
 
         Ok(response.content)
     }

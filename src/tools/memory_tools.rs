@@ -2,21 +2,19 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::Tool;
-use crate::llm::embedding::EmbeddingEngine;
-use crate::memory_brain::MemoryBrain;
+use crate::memory_brain::Brain;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
 // ─── MemoryStore ────────────────────────────────────────────────
 
 pub struct MemoryStore {
-    brain: Arc<MemoryBrain>,
-    embedder: Arc<dyn EmbeddingEngine>,
+    brain: Arc<std::sync::Mutex<Brain>>,
 }
 
 impl MemoryStore {
-    pub fn new(brain: Arc<MemoryBrain>, embedder: Arc<dyn EmbeddingEngine>) -> Self {
-        Self { brain, embedder }
+    pub fn new(brain: Arc<std::sync::Mutex<Brain>>) -> Self {
+        Self { brain }
     }
 }
 
@@ -52,27 +50,23 @@ impl Tool for MemoryStore {
         let content = params["content"]
             .as_str()
             .context("missing 'content' parameter")?;
-        let content_type = params["content_type"].as_str().unwrap_or("note");
-        let importance = params["importance"].as_f64().unwrap_or(0.5);
 
-        // Try to store with embedding for semantic search
-        let id = match self.embedder.embed(content).await {
-            Ok(emb) => self.brain.store_with_embedding(content, content_type, &emb, importance)?,
-            Err(_) => self.brain.store_memory(content, content_type, None, None, importance)?,
-        };
+        let mut brain = self.brain.lock().unwrap();
+        let mtype = crate::memory_brain::MemoryType::Semantic;
+        brain.process(content, Some(mtype))?;
 
-        Ok(json!({ "memory_id": id, "stored": true }))
+        Ok(json!({ "stored": true }))
     }
 }
 
 // ─── MemoryRecall ───────────────────────────────────────────────
 
 pub struct MemoryRecall {
-    brain: Arc<MemoryBrain>,
+    brain: Arc<std::sync::Mutex<Brain>>,
 }
 
 impl MemoryRecall {
-    pub fn new(brain: Arc<MemoryBrain>) -> Self {
+    pub fn new(brain: Arc<std::sync::Mutex<Brain>>) -> Self {
         Self { brain }
     }
 }
@@ -105,15 +99,16 @@ impl Tool for MemoryRecall {
         let query = params["query"].as_str().context("missing 'query' parameter")?;
         let limit = params["limit"].as_i64().unwrap_or(10) as usize;
 
-        let results = self.brain.search_memories(query, limit)?;
+        let brain = self.brain.lock().unwrap();
+        let results = brain.recall(query, limit);
         let items: Vec<Value> = results
             .into_iter()
-            .map(|(id, content, content_type, importance)| {
+            .map(|item| {
                 json!({
-                    "id": id,
-                    "content": content,
-                    "type": content_type,
-                    "importance": importance,
+                    "id": item.id.to_string(),
+                    "content": item.content,
+                    "type": item.memory_type.to_string(),
+                    "strength": item.strength,
                 })
             })
             .collect();
@@ -125,11 +120,11 @@ impl Tool for MemoryRecall {
 // ─── MemoryStats ────────────────────────────────────────────────
 
 pub struct MemoryStats {
-    brain: Arc<MemoryBrain>,
+    brain: Arc<std::sync::Mutex<Brain>>,
 }
 
 impl MemoryStats {
-    pub fn new(brain: Arc<MemoryBrain>) -> Self {
+    pub fn new(brain: Arc<std::sync::Mutex<Brain>>) -> Self {
         Self { brain }
     }
 }
@@ -140,7 +135,7 @@ impl Tool for MemoryStats {
         "memory_stats"
     }
     fn description(&self) -> &str {
-        "Get statistics about the MemoryBrain — memory count, skill count, reflection status."
+        "Get statistics about the Brain — memory count by type."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -149,15 +144,12 @@ impl Tool for MemoryStats {
         })
     }
     async fn execute(&self, _params: Value) -> Result<Value> {
-        let stats = self.brain.get_memory_stats()?;
-        let skills = self.brain.list_skills()?;
-        let pending = self.brain.pending_reflections()?;
-        let summary = self.brain.generate_context_summary()?;
+        let brain = self.brain.lock().unwrap();
+        let stats = brain.stats();
+        let summary = brain.generate_context_summary();
 
         Ok(json!({
             "memory_stats": stats,
-            "skill_count": skills.len(),
-            "pending_reflections": pending.len(),
             "summary": summary,
         }))
     }
@@ -166,11 +158,11 @@ impl Tool for MemoryStats {
 // ─── Reflect ────────────────────────────────────────────────────
 
 pub struct Reflect {
-    brain: Arc<MemoryBrain>,
+    brain: Arc<std::sync::Mutex<Brain>>,
 }
 
 impl Reflect {
-    pub fn new(brain: Arc<MemoryBrain>) -> Self {
+    pub fn new(brain: Arc<std::sync::Mutex<Brain>>) -> Self {
         Self { brain }
     }
 }
@@ -207,15 +199,11 @@ impl Tool for Reflect {
         let observation = params["observation"]
             .as_str()
             .context("missing 'observation' parameter")?;
-        let hypothesis = params["hypothesis"].as_str();
-        let action_plan = params["action_plan"].as_str();
 
-        let id = self
-            .brain
-            .record_reflection("agent_insight", observation, hypothesis, action_plan)?;
+        let mut brain = self.brain.lock().unwrap();
+        brain.record_reflection("agent_insight", observation)?;
 
         Ok(json!({
-            "reflection_id": id,
             "recorded": true,
             "message": "Reflection recorded. It will be reviewed in the next evolution cycle."
         }))

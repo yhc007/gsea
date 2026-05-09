@@ -32,10 +32,13 @@ clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
 
 # UUID for session IDs
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # Interactive REPL
 rustyline = "14"
 
 # TTY detection
 atty = "0.2"
+
+# Date/time (memory-brain types)
+chrono = { version = "0.4", features = ["serde"] }

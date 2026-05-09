@@ -15,7 +15,7 @@ use llm::{
     embedding::{EmbeddingEngine, OllamaEmbedder},
     OllamaClient,
 };
-use memory_brain::MemoryBrain;
+use memory_brain::Brain;
 use tools::{
     file_tools,
     memory_tools,
@@ -34,7 +34,7 @@ struct Cli {
     ollama_url: String,
 
     /// Path to the MemoryBrain SQLite database
-    #[arg(short = 'd', long, default_value = "memory/gsea.db")]
+    #[arg(short = 'd', long, default_value = "memory")]
     db_path: String,
 
     /// Embedding model for semantic memory search
@@ -65,9 +65,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Initialize MemoryBrain
-    let brain = Arc::new(MemoryBrain::open(&cli.db_path)?);
-    tracing::info!("MemoryBrain initialized at {}", cli.db_path);
+    // Initialize Brain (memory-brain)
+    let brain = Arc::new(std::sync::Mutex::new(Brain::new(&cli.db_path)?));
+    tracing::info!("Brain initialized at {}", cli.db_path);
 
     // Initialize Ollama client
     let llm = OllamaClient::new(&cli.ollama_url, &cli.model);
@@ -86,7 +86,8 @@ async fn main() -> Result<()> {
     registry.register(Box::new(file_tools::RunShell));
     registry.register(Box::new(file_tools::CargoBuild));
     registry.register(Box::new(file_tools::CargoTest));
-    registry.register(Box::new(memory_tools::MemoryStore::new(brain.clone(), embedder.clone())));
+    registry.register(Box::new(file_tools::GitCommit));
+    registry.register(Box::new(memory_tools::MemoryStore::new(brain.clone())));
     registry.register(Box::new(memory_tools::MemoryRecall::new(brain.clone())));
     registry.register(Box::new(memory_tools::MemoryStats::new(brain.clone())));
     registry.register(Box::new(memory_tools::Reflect::new(brain.clone())));
@@ -168,7 +169,8 @@ async fn run_interactive(
                         continue;
                     }
                     "/stats" => {
-                        let stats = evolution.brain.get_memory_stats()?;
+                        let brain = evolution.brain.lock().unwrap();
+                        let stats = brain.stats();
                         println!("{}", serde_json::to_string_pretty(&stats)?);
                         continue;
                     }

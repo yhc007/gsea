@@ -234,3 +234,68 @@ impl Tool for CargoTest {
         }))
     }
 }
+
+// ─── GitCommit ──────────────────────────────────────────────────
+
+pub struct GitCommit;
+
+#[async_trait]
+impl Tool for GitCommit {
+    fn name(&self) -> &str {
+        "git_commit"
+    }
+    fn description(&self) -> &str {
+        "Stage all changes and create a git commit with the given message."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "Commit message"
+                },
+                "project_dir": {
+                    "type": "string",
+                    "description": "Path to the git project directory (default: .)"
+                }
+            },
+            "required": ["message"]
+        })
+    }
+    async fn execute(&self, params: Value) -> Result<Value> {
+        let msg = params["message"]
+            .as_str()
+            .context("missing 'message' parameter")?;
+        let project_dir = params["project_dir"]
+            .as_str()
+            .unwrap_or(".")
+            .to_string();
+
+        let add_output = tokio::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&project_dir)
+            .output()
+            .await?;
+
+        let commit_output = tokio::process::Command::new("git")
+            .args(["commit", "-m", msg])
+            .current_dir(&project_dir)
+            .output()
+            .await?;
+
+        let diff_output = tokio::process::Command::new("git")
+            .args(["diff", "--stat", "HEAD~1..HEAD", "--"])
+            .current_dir(&project_dir)
+            .output()
+            .await;
+
+        Ok(json!({
+            "add_stdout": String::from_utf8_lossy(&add_output.stdout).to_string(),
+            "commit_stdout": String::from_utf8_lossy(&commit_output.stdout).to_string(),
+            "commit_stderr": String::from_utf8_lossy(&commit_output.stderr).to_string(),
+            "commit_success": commit_output.status.success(),
+            "diff_stat": diff_output.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default(),
+        }))
+    }
+}
