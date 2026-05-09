@@ -1,11 +1,13 @@
 /// Converts a string to title case (first letter of each word capitalized).
 pub fn to_title_case(s: &str) -> String {
     s.split_whitespace()
-        .map(|word| {
+        .filter_map(|word| {
             let mut chars = word.chars();
-            let first = chars.next().unwrap().to_uppercase().collect::<String>();
-            let rest: String = chars.collect();
-            format!("{}{}", first, rest.to_lowercase())
+            chars.next().map(|first| {
+                let capitalized = first.to_uppercase().collect::<String>();
+                let rest: String = chars.collect();
+                format!("{}{}", capitalized, rest.to_lowercase())
+            })
         })
         .collect::<Vec<String>>()
         .join(" ")
@@ -20,5 +22,6 @@ mod tests {
         assert_eq!(to_title_case("hello world"), "Hello World");
         assert_eq!(to_title_case("rust"), "Rust");
         assert_eq!(to_title_case(""), "");
+        assert_eq!(to_title_case("  "), "");
     }
 }

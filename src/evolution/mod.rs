@@ -193,39 +193,48 @@ Current system state:
         None
     }
 
-    /// Add a `pub mod {name};` line to the skills module.
+    /// Add a `pub mod {name};` line to the skills module (using exact line match).
     async fn add_skill_module(&self, mod_path: &str, name: &str) -> bool {
-        let line = format!("pub mod {};\n", name);
-        match tokio::fs::read_to_string(mod_path).await {
-            Ok(mut content) => {
-                if !content.contains(&line) {
-                    content.push_str(&line);
-                    tokio::fs::write(mod_path, &content).await.is_ok()
-                } else {
-                    true // already present
-                }
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// Remove a `pub mod {name};` line from the skills module (for rollback).
-    async fn remove_skill_module(&self, mod_path: &str, name: &str) -> bool {
-        let search = format!("pub mod {};\n", name);
+        let line = format!("pub mod {};", name);
         match tokio::fs::read_to_string(mod_path).await {
             Ok(content) => {
-                let new_content = content.replace(&search, "");
-                tokio::fs::write(mod_path, &new_content).await.is_ok()
+                if content.lines().any(|l| l.trim() == line) {
+                    return true; // already present
+                }
+                let new_content = format!("{}\npub mod {};\n", content.trim_end(), name);
+                tokio::fs::write(mod_path, new_content).await.is_ok()
             }
             Err(_) => false,
         }
     }
 
-    /// Run cargo build to verify the skill compiles.
+    /// Remove a `pub mod {name};` line from the skills module (exact line match).
+    async fn remove_skill_module(&self, mod_path: &str, name: &str) -> bool {
+        let search = format!("pub mod {};", name);
+        match tokio::fs::read_to_string(mod_path).await {
+            Ok(content) => {
+                let new_content: String = content.lines()
+                    .filter(|l| l.trim() != search)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let new_content = format!("{}\n", new_content.trim_end());
+                tokio::fs::write(mod_path, new_content).await.is_ok()
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Run cargo build to verify the skill compiles, using the binary's own directory.
     async fn build_project(&self) -> bool {
+        let project_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
         let output = tokio::process::Command::new("cargo")
             .args(["build", "--message-format=short"])
-            .current_dir(std::env::current_dir().unwrap_or_default())
+            .current_dir(&project_dir)
             .output()
             .await;
         matches!(output, Ok(o) if o.status.success())

@@ -66,6 +66,24 @@ impl Agent {
         }
     }
 
+    /// Save the current conversation history to a JSON file.
+    pub fn save_session(&self, path: &str) -> Result<()> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&self.messages)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Load conversation history from a JSON file (replaces current messages).
+    pub fn load_session(&mut self, path: &str) -> Result<()> {
+        let json = std::fs::read_to_string(path)?;
+        let messages: Vec<Message> = serde_json::from_str(&json)?;
+        self.messages = messages;
+        Ok(())
+    }
+
     /// Process a message using the fast model (qwen3:8b).
     /// Used by EvolutionEngine for self-review and code generation.
     pub async fn process_message_fast(&mut self, prompt: &str) -> Result<String> {
@@ -129,6 +147,58 @@ When you're done, provide a final response to the user."#,
         )
     }
 
+    /// Heuristically select model based on prompt complexity.
+    /// Returns true if the main (complex/capable) model should be used.
+    fn needs_complex_model(input: &str) -> bool {
+        let trimmed = input.trim();
+
+        // Short, simple greetings → fast model
+        if trimmed.len() < 80 && !trimmed.contains("```") {
+            let simple_words = ["hi", "hello", "hey", "ok", "okay", "yes", "no", "thanks",
+                                "bye", "goodbye", "exit", "quit", "help", "/help", "/tools",
+                                "/stats", "/reflect"];
+            let lower = trimmed.to_lowercase();
+            if simple_words.iter().any(|w| lower == *w || lower.starts_with(w)) {
+                return false;
+            }
+        }
+
+        // Contains code blocks or technical keywords → complex model
+        let complex_patterns = [
+            "```", "fn ", "impl ", "struct ", "enum ", "trait ",
+            "rust", "compile", "refactor", "optimize", "review",
+            "debug", "analyze", "memory", "async", "unsafe",
+            "cargo", "build", "test", "benchmark",
+        ];
+        let lower = trimmed.to_lowercase();
+        if complex_patterns.iter().any(|p| lower.contains(p)) {
+            return true;
+        }
+
+        // Longer technical requests → complex model
+        if trimmed.len() > 200 {
+            return true;
+        }
+
+        // Default to fast model for simple conversational queries
+        false
+    }
+
+    /// Send a chat request using the appropriate model based on prompt complexity.
+    /// Logs which model was selected.
+    async fn chat_with_selected_model(&self, messages: Vec<Message>) -> Result<Message> {
+        let last_user = messages.iter().rev().find(|m| m.role == "user");
+        let use_main = last_user.map(|m| Self::needs_complex_model(&m.content)).unwrap_or(true);
+
+        if use_main {
+            tracing::debug!("Using main model for response");
+            self.llm.chat(messages).await
+        } else {
+            tracing::debug!("Using fast model for response");
+            self.fast_llm.chat(messages).await
+        }
+    }
+
     /// Process a single user message — the core agent loop.
     pub async fn process_message(&mut self, user_input: &str) -> Result<String> {
         // 1. Recall relevant memories (embedding-based, with keyword fallback)
@@ -186,12 +256,16 @@ When you're done, provide a final response to the user."#,
             content: augmented_input,
         });
 
-        // 3. Send to Gemma and get response
+        // 3. Send to appropriate model and get response
         let tool_specs = self.tools.lock().unwrap().tool_specs();
-        let response = self
-            .llm
-            .chat_with_tools(self.messages.clone(), tool_specs)
-            .await?;
+        let use_main = Self::needs_complex_model(user_input);
+        let response = if use_main {
+            tracing::debug!("Using main model (gemma4:26b) for: {:.60}", user_input);
+            self.llm.chat_with_tools(self.messages.clone(), tool_specs).await?
+        } else {
+            tracing::info!("Using fast model (qwen3:8b) for: {:.60}", user_input);
+            self.fast_llm.chat_with_tools(self.messages.clone(), tool_specs).await?
+        };
 
         let response_content = response.message.content.clone();
         self.messages.push(Message {

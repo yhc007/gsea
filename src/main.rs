@@ -57,6 +57,14 @@ struct Cli {
     #[arg(short, long)]
     interactive: bool,
 
+    /// Resume from a saved session file
+    #[arg(long)]
+    resume: Option<String>,
+
+    /// Save session to this path on exit (interactive mode only)
+    #[arg(long, default_value = "sessions/latest.json")]
+    session_out: String,
+
     /// One-shot prompt (non-interactive)
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     prompt: Vec<String>,
@@ -81,6 +89,13 @@ async fn main() -> Result<()> {
     let llm = OllamaClient::new(&cli.ollama_url, &cli.model);
     let fast_llm = OllamaClient::new(&cli.ollama_url, &cli.fast_model);
     tracing::info!("Main model: {}, Fast model: {}", cli.model, cli.fast_model);
+
+    // Check for "review" subcommand (before creating agent, since review doesn't need one)
+    let is_review = cli.prompt.first().map(|s| s == "review").unwrap_or(false);
+    if is_review {
+        let rev = cli.prompt.get(1).cloned().unwrap_or_else(|| "HEAD~1".to_string());
+        return run_review(&llm, &rev).await;
+    }
 
     // Initialize embedding engine
     let embedder: Arc<dyn EmbeddingEngine> = Arc::new(OllamaEmbedder::new(
@@ -114,12 +129,27 @@ async fn main() -> Result<()> {
     // Create agent (with fast model for evolution)
     let mut agent = Agent::new(llm, fast_llm, brain.clone(), registry.clone(), embedder);
 
+    // Resume session if requested
+    if let Some(ref session_path) = cli.resume {
+        match agent.load_session(session_path) {
+            Ok(_) => tracing::info!("Resumed session from {}", session_path),
+            Err(e) => tracing::warn!("Could not load session {}: {}", session_path, e),
+        }
+    }
+
     // Create evolution engine
     let mut evolution = EvolutionEngine::new(brain.clone(), registry.clone(), cli.reflect_interval);
 
     // Run mode
     if cli.interactive {
+        let session_path = cli.session_out.clone();
         run_interactive(&mut agent, &mut evolution).await?;
+        // Save session on exit
+        if let Err(e) = agent.save_session(&session_path) {
+            tracing::warn!("Failed to save session: {}", e);
+        } else {
+            tracing::info!("Session saved to {}", session_path);
+        }
     } else if !cli.prompt.is_empty() {
         let prompt = cli.prompt.join(" ");
         run_one_shot(&mut agent, &mut evolution, &prompt).await?;
@@ -139,6 +169,54 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// ─── Code Review ──────────────────────────────────────────────
+
+/// Review a git diff. Usage: gsea review [<git-ref>]
+async fn run_review(llm: &OllamaClient, rev: &str) -> Result<()> {
+    // Get the git diff
+    let output = tokio::process::Command::new("git")
+        .args(["diff", rev])
+        .output()
+        .await?;
+
+    let diff = String::from_utf8_lossy(&output.stdout);
+    if diff.trim().is_empty() {
+        println!("No diff found against {}", rev);
+        return Ok(());
+    }
+
+    let prompt = format!(
+        r#"You are a senior Rust code reviewer. Review the following git diff and provide:
+
+1. **Summary**: What does this change do in one sentence?
+2. **Issues**: Any bugs, safety concerns, or style problems? Be specific.
+3. **Suggestions**: Concrete code improvement suggestions.
+
+```diff
+{}
+```"#,
+        diff
+    );
+
+    let messages = vec![
+        crate::llm::Message {
+            role: "system".to_string(),
+            content: "You are a concise, senior Rust code reviewer.".to_string(),
+        },
+        crate::llm::Message {
+            role: "user".to_string(),
+            content: prompt,
+        },
+    ];
+
+    let response = llm.chat(messages).await?;
+    println!("{}", "-".repeat(50));
+    println!("📋 Code Review (diff against {})", rev);
+    println!("{}", "-".repeat(50));
+    println!("{}", response.content);
     Ok(())
 }
 
