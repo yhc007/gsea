@@ -18,6 +18,10 @@ impl ProceduralMemory {
         Ok(())
     }
 
+    pub fn search_by_embedding(&self, query_emb: &[f32], limit: usize, min_score: f64) -> Vec<(MemoryItem, f64)> {
+        self.storage.search_by_embedding(query_emb, limit, MemoryType::Procedural, min_score)
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Vec<MemoryItem> {
         self.storage.search(query, limit, MemoryType::Procedural)
     }

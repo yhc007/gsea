@@ -53,3 +53,51 @@ impl WorkingMemory {
         self.items.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory_brain::types::*;
+
+    #[test]
+    fn test_working_memory_basic() {
+        let mut wm = WorkingMemory::new(3);
+        assert_eq!(wm.len(), 0);
+        assert!(wm.is_empty());
+
+        wm.push(MemoryItem::new("a", MemoryType::Working));
+        wm.push(MemoryItem::new("b", MemoryType::Working));
+        wm.push(MemoryItem::new("c", MemoryType::Working));
+        assert_eq!(wm.len(), 3);
+        assert!(!wm.is_empty());
+    }
+
+    #[test]
+    fn test_working_memory_eviction() {
+        let mut wm = WorkingMemory::new(2);
+        wm.push(MemoryItem::new("a", MemoryType::Working));
+        wm.push(MemoryItem::new("b", MemoryType::Working));
+        wm.push(MemoryItem::new("c", MemoryType::Working));
+        assert_eq!(wm.len(), 2); // one was evicted
+    }
+
+    #[test]
+    fn test_working_memory_search() {
+        let mut wm = WorkingMemory::new(10);
+        wm.push(MemoryItem::new("rust programming", MemoryType::Working));
+        wm.push(MemoryItem::new("python scripting", MemoryType::Working));
+
+        let results = wm.search("rust");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("rust"));
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut wm = WorkingMemory::new(5);
+        wm.push(MemoryItem::new("test", MemoryType::Working));
+        assert!(!wm.is_empty());
+        wm.clear();
+        assert!(wm.is_empty());
+    }
+}

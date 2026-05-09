@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 pub mod file_tools;
 pub mod memory_tools;
+pub mod skill_tools;
 
 /// A tool that the agent can invoke. Each tool has a name, description,
 /// and an `execute` method that takes JSON parameters and returns JSON.
@@ -54,6 +55,11 @@ impl ToolRegistry {
 
     pub fn list_tools(&self) -> Vec<&dyn Tool> {
         self.tools.values().map(|b| b.as_ref()).collect()
+    }
+
+    /// Register a tool by name (used for dynamic skill registration).
+    pub fn register_by_name(&mut self, name: &str, tool: Box<dyn Tool>) {
+        self.tools.insert(name.to_string(), tool);
     }
 
     pub fn tool_description_text(&self) -> String {

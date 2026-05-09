@@ -32,3 +32,39 @@ impl ForgettingCurve {
         self.retention(1.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_retention_at_zero() {
+        let curve = ForgettingCurve::new();
+        let r = curve.retention(0.0);
+        assert!((r - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_retention_decays() {
+        let curve = ForgettingCurve::new();
+        let r1 = curve.retention(1.0);
+        let r7 = curve.retention(168.0); // 1 week
+        assert!(r1 > 0.99);
+        assert!((r7 - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_decay_factor_between_0_and_1() {
+        let curve = ForgettingCurve::new();
+        let factor = curve.decay_factor();
+        assert!(factor > 0.0);
+        assert!(factor <= 1.0);
+    }
+
+    #[test]
+    fn test_custom_half_life() {
+        let curve = ForgettingCurve::with_half_life(1.0); // 1 hour
+        let r1 = curve.retention(1.0);
+        assert!((r1 - 0.5).abs() < 0.01);
+    }
+}

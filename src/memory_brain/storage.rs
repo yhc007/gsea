@@ -5,6 +5,27 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+// ─── Embedding vector helpers ───────────────────────────────────
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| *x as f64 * *y as f64).sum();
+    let norm_a: f64 = a.iter().map(|x| *x as f64 * *x as f64).sum::<f64>().sqrt();
+    let norm_b: f64 = b.iter().map(|x| *x as f64 * *x as f64).sum::<f64>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 { return 0.0; }
+    dot / (norm_a * norm_b)
+}
+
+fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn blob_to_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
 pub struct Storage {
     conn: Mutex<Connection>,
     table: String,
@@ -132,6 +153,61 @@ impl Storage {
         let guard = self.conn.lock().unwrap();
         guard.execute(&sql, rusqlite::params![factor, mtype])?;
         Ok(())
+    }
+
+    /// Search memories by embedding similarity (cosine).
+    /// Returns (MemoryItem, score) sorted by descending similarity.
+    pub fn search_by_embedding(
+        &self,
+        query_emb: &[f32],
+        limit: usize,
+        memory_type: MemoryType,
+        min_score: f64,
+    ) -> Vec<(MemoryItem, f64)> {
+        let mtype = memory_type.to_string();
+        let sql = format!(
+            "SELECT id, content, context, emotion, created_at, last_accessed, access_count, strength, embedding, associations, tags
+             FROM {} WHERE memory_type = ?1 AND embedding IS NOT NULL",
+            self.table
+        );
+
+        let guard = self.conn.lock().unwrap();
+        let mut stmt = match guard.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows: Vec<(MemoryItem, f64)> = match stmt.query_map(rusqlite::params![mtype], |row| {
+            let assoc_str: String = row.get(9)?;
+            let tags_str: String = row.get(10)?;
+            let emb_blob: Vec<u8> = row.get(8)?;
+            let emb = blob_to_vec(&emb_blob);
+
+            let item = MemoryItem {
+                id: row.get::<_, String>(0).and_then(|s| Uuid::parse_str(&s).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))).unwrap_or_default(),
+                content: row.get(1)?,
+                context: row.get(2)?,
+                memory_type: memory_type.clone(),
+                emotion: serde_json::from_str::<Emotion>(&format!("\"{}\"", row.get::<_, String>(3).unwrap_or_default())).unwrap_or(Emotion::Neutral),
+                created_at: row.get(4)?,
+                last_accessed: row.get(5)?,
+                access_count: row.get(6)?,
+                strength: row.get(7)?,
+                embedding: Some(emb.clone()),
+                associations: serde_json::from_str(&assoc_str).unwrap_or_default(),
+                tags: serde_json::from_str(&tags_str).unwrap_or_default(),
+            };
+            let score = cosine_similarity(query_emb, &emb);
+            Ok((item, score))
+        }) {
+            Ok(r) => r.filter_map(|r| r.ok()).filter(|(_, s)| *s >= min_score).collect(),
+            Err(_) => Vec::new(),
+        };
+
+        let mut scored = rows;
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        scored
     }
 
     pub fn count(&self, memory_type: MemoryType) -> i64 {

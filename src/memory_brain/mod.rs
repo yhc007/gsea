@@ -144,6 +144,17 @@ impl Brain {
         self.procedural.get_skill_code(name)
     }
 
+    /// Search across all memory types by embedding similarity.
+    pub fn recall_by_similarity(&self, query_emb: &[f32], limit: usize, min_score: f64) -> Vec<(MemoryItem, f64)> {
+        let mut results = Vec::new();
+        results.extend(self.episodic.search_by_embedding(query_emb, limit, min_score));
+        results.extend(self.semantic.search_by_embedding(query_emb, limit, min_score));
+        results.extend(self.procedural.search_by_embedding(query_emb, limit, min_score));
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        results
+    }
+
     /// Get statistics about all memory systems.
     pub fn stats(&self) -> serde_json::Value {
         serde_json::json!({

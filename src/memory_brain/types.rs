@@ -106,3 +106,43 @@ impl MemoryItem {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memory_item_creation() {
+        let item = MemoryItem::new("test content", MemoryType::Semantic);
+        assert_eq!(item.content, "test content");
+        assert_eq!(item.memory_type, MemoryType::Semantic);
+        assert_eq!(item.strength, 1.0);
+    }
+
+    #[test]
+    fn test_memory_item_type_display() {
+        assert_eq!(MemoryType::Working.to_string(), "working");
+        assert_eq!(MemoryType::Episodic.to_string(), "episodic");
+        assert_eq!(MemoryType::Semantic.to_string(), "semantic");
+        assert_eq!(MemoryType::Procedural.to_string(), "procedural");
+    }
+
+    #[test]
+    fn test_relevance_score() {
+        let item = MemoryItem::new("test", MemoryType::Semantic);
+        let score = item.relevance_score();
+        assert!(score > 0.0);
+        assert!(score <= 1.0);
+    }
+
+    #[test]
+    fn test_emotional_memory_stronger() {
+        let mut neutral = MemoryItem::new("neutral", MemoryType::Semantic);
+        neutral.strength = 0.5;
+        let emotional = MemoryItem::new("emotional", MemoryType::Semantic)
+            .with_emotion(Emotion::Positive);
+        // emotional starts at 1.0, gets boosted to min(1.5, 1.0) = 1.0
+        // neutral is 0.5 → emotional > neutral
+        assert!(emotional.strength > neutral.strength);
+    }
+}

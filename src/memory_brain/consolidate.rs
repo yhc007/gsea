@@ -31,3 +31,32 @@ impl Consolidator {
         MemoryType::Semantic
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_code_as_procedural() {
+        let c = Consolidator::new();
+        let item = MemoryItem::new("pub fn foo() { let x = 1; }", MemoryType::Semantic);
+        let result = c.classify(&item);
+        assert_eq!(result, MemoryType::Procedural);
+    }
+
+    #[test]
+    fn test_classify_time_as_episodic() {
+        let c = Consolidator::new();
+        let item = MemoryItem::new("Today I fixed a bug in the parser", MemoryType::Semantic);
+        let result = c.classify(&item);
+        assert_eq!(result, MemoryType::Episodic);
+    }
+
+    #[test]
+    fn test_classify_fact_as_semantic() {
+        let c = Consolidator::new();
+        let item = MemoryItem::new("Rust ensures memory safety through ownership", MemoryType::Working);
+        let result = c.classify(&item);
+        assert_eq!(result, MemoryType::Semantic);
+    }
+}

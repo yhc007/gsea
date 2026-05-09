@@ -1,3 +1,6 @@
+// Suppress dead_code warnings for intentionally retained future-use API surface
+#![allow(dead_code)]
+
 mod agent;
 mod evolution;
 mod llm;
@@ -19,6 +22,7 @@ use memory_brain::Brain;
 use tools::{
     file_tools,
     memory_tools,
+    skill_tools,
     ToolRegistry,
 };
 
@@ -79,29 +83,33 @@ async fn main() -> Result<()> {
     ));
     tracing::info!("Embedding engine initialized with model: {}", cli.embed_model);
 
-    // Build tool registry
-    let mut registry = ToolRegistry::new();
-    registry.register(Box::new(file_tools::ReadFile));
-    registry.register(Box::new(file_tools::WriteFile));
-    registry.register(Box::new(file_tools::RunShell));
-    registry.register(Box::new(file_tools::CargoBuild));
-    registry.register(Box::new(file_tools::CargoTest));
-    registry.register(Box::new(file_tools::GitCommit));
-    registry.register(Box::new(memory_tools::MemoryStore::new(brain.clone())));
-    registry.register(Box::new(memory_tools::MemoryRecall::new(brain.clone())));
-    registry.register(Box::new(memory_tools::MemoryStats::new(brain.clone())));
-    registry.register(Box::new(memory_tools::Reflect::new(brain.clone())));
+    // Build tool registry (shared between Agent and EvolutionEngine)
+    let registry = Arc::new(std::sync::Mutex::new(ToolRegistry::new()));
+    {
+        let mut reg = registry.lock().unwrap();
+        reg.register(Box::new(file_tools::ReadFile));
+        reg.register(Box::new(file_tools::WriteFile));
+        reg.register(Box::new(file_tools::RunShell));
+        reg.register(Box::new(file_tools::CargoBuild));
+        reg.register(Box::new(file_tools::CargoTest));
+        reg.register(Box::new(file_tools::GitCommit));
+        reg.register(Box::new(memory_tools::MemoryStore::new(brain.clone())));
+        reg.register(Box::new(memory_tools::MemoryRecall::new(brain.clone())));
+        reg.register(Box::new(memory_tools::MemoryStats::new(brain.clone())));
+        reg.register(Box::new(memory_tools::Reflect::new(brain.clone())));
+        reg.register(Box::new(skill_tools::CallSkill::new(brain.clone())));
+    }
 
     tracing::info!(
-        "GSEA initialized with {} tools",
-        registry.list_tools().len()
+        "GSEA initialized with {} tools (startup)",
+        registry.lock().unwrap().list_tools().len()
     );
 
     // Create agent
-    let mut agent = Agent::new(llm, brain.clone(), registry, embedder);
+    let mut agent = Agent::new(llm, brain.clone(), registry.clone(), embedder);
 
     // Create evolution engine
-    let mut evolution = EvolutionEngine::new(brain.clone(), cli.reflect_interval);
+    let mut evolution = EvolutionEngine::new(brain.clone(), registry.clone(), cli.reflect_interval);
 
     // Run mode
     if cli.interactive {

@@ -3,18 +3,25 @@ use std::sync::Arc;
 
 use crate::agent::Agent;
 use crate::memory_brain::Brain;
+use crate::tools::{ToolRegistry, skill_tools};
 
 /// The evolution engine periodically triggers self-review and self-improvement.
 pub struct EvolutionEngine {
     pub brain: Arc<std::sync::Mutex<Brain>>,
+    pub registry: Arc<std::sync::Mutex<ToolRegistry>>,
     reflection_interval: u64,
     episode_count: u64,
 }
 
 impl EvolutionEngine {
-    pub fn new(brain: Arc<std::sync::Mutex<Brain>>, reflection_interval: u64) -> Self {
+    pub fn new(
+        brain: Arc<std::sync::Mutex<Brain>>,
+        registry: Arc<std::sync::Mutex<ToolRegistry>>,
+        reflection_interval: u64,
+    ) -> Self {
         Self {
             brain,
+            registry,
             reflection_interval,
             episode_count: 0,
         }
@@ -108,13 +115,24 @@ Current system state:
             let brain = self.brain.lock().unwrap();
             brain.store_skill(fn_name, description, &code)?;
         }
+
+        // Register as dynamic tool in the shared registry
+        {
+            let mut reg = self.registry.lock().unwrap();
+            let dyn_tool = Box::new(skill_tools::DynamicSkillTool::new(
+                self.brain.clone(), fn_name, description,
+            ));
+            reg.register_by_name(fn_name, dyn_tool);
+            tracing::info!("Registered '{}' as a dynamic tool", fn_name);
+        }
+
         tracing::info!("Skill '{}' stored in Brain and saved to {}", fn_name, file_path);
 
         // Git commit
         self.git_commit(fn_name).await;
 
         Ok(format!(
-            "✅ Skill '{}' created and committed.\n```rust\n{}\n```",
+            "✅ Skill '{}' created, committed, and registered as a tool.\n```rust\n{}\n```",
             fn_name, code
         ))
     }
@@ -166,26 +184,6 @@ Current system state:
         None
     }
 
-    async fn build_project(&self) -> String {
-        let output = tokio::process::Command::new("cargo")
-            .args(["build", "--message-format=json"])
-            .current_dir(std::env::current_dir().unwrap_or_default())
-            .output()
-            .await;
-
-        match output {
-            Ok(out) => {
-                format!(
-                    "success: {} | stdout: {} | stderr: {}",
-                    out.status.success(),
-                    String::from_utf8_lossy(&out.stdout).lines().last().unwrap_or(""),
-                    String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or(""),
-                )
-            }
-            Err(e) => format!("cargo error: {}", e),
-        }
-    }
-
     async fn git_commit(&self, skill_name: &str) {
         let msg = format!("gsea: auto-learned skill '{}'", skill_name);
         let _ = tokio::process::Command::new("git")
@@ -198,5 +196,68 @@ Current system state:
             .current_dir(std::env::current_dir().unwrap_or_default())
             .output()
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EvolutionEngine;
+    use crate::memory_brain::Brain;
+    use std::sync::{Arc, Mutex};
+
+    // Helper: create a minimal EvolutionEngine for testing
+    fn test_engine() -> EvolutionEngine {
+        let brain = Arc::new(Mutex::new(Brain::new("/tmp/gsea_test_memory").unwrap()));
+        let registry = Arc::new(Mutex::new(crate::tools::ToolRegistry::new()));
+        EvolutionEngine::new(brain, registry, 5)
+    }
+
+    #[test]
+    fn test_extract_rust_code_with_markers() {
+        let engine = test_engine();
+        let text = "Here's the code:\n```rust\npub fn foo() -> bool { true }\n```\nEnd.";
+        let code = engine.extract_rust_code(text);
+        assert_eq!(code, Some("pub fn foo() -> bool { true }".to_string()));
+    }
+
+    #[test]
+    fn test_extract_rust_code_without_lang() {
+        let engine = test_engine();
+        let text = "Code:\n```\npub fn bar() {}\n```\nDone.";
+        let code = engine.extract_rust_code(text);
+        assert_eq!(code, Some("pub fn bar() {}".to_string()));
+    }
+
+    #[test]
+    fn test_extract_rust_code_none() {
+        let engine = test_engine();
+        assert!(engine.extract_rust_code("no code here").is_none());
+    }
+
+    #[test]
+    fn test_extract_fn_name_pub() {
+        let engine = test_engine();
+        let code = "pub fn is_all_even(nums: &[i32]) -> bool { true }";
+        assert_eq!(engine.extract_fn_name(code), Some("is_all_even"));
+    }
+
+    #[test]
+    fn test_extract_fn_name_private() {
+        let engine = test_engine();
+        let code = "fn helper(x: i32) -> i32 { x }";
+        assert_eq!(engine.extract_fn_name(code), Some("helper"));
+    }
+
+    #[test]
+    fn test_extract_fn_name_none() {
+        let engine = test_engine();
+        assert!(engine.extract_fn_name("struct Foo;").is_none());
+    }
+
+    #[test]
+    fn test_extract_description() {
+        let engine = test_engine();
+        let code = "/// Check if all numbers are even\npub fn is_all_even() -> bool { true }";
+        assert_eq!(engine.extract_description(code), Some("Check if all numbers are even"));
     }
 }

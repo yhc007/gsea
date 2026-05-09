@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use crate::llm::{embedding::EmbeddingEngine, Message, OllamaClient};
 use crate::memory_brain::Brain;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolRegistry, skill_tools};
 
 /// The core agent loop. Manages conversation with Gemma, tool execution,
 /// and memory logging.
 pub struct Agent {
     llm: OllamaClient,
     brain: Arc<std::sync::Mutex<Brain>>,
-    tools: ToolRegistry,
+    pub tools: Arc<std::sync::Mutex<ToolRegistry>>,
     embedder: Arc<dyn EmbeddingEngine>,
     session_id: String,
     messages: Vec<Message>,
@@ -22,11 +22,22 @@ impl Agent {
     pub fn new(
         llm: OllamaClient,
         brain: Arc<std::sync::Mutex<Brain>>,
-        tools: ToolRegistry,
+        tools: Arc<std::sync::Mutex<ToolRegistry>>,
         embedder: Arc<dyn EmbeddingEngine>,
     ) -> Self {
         let session_id = uuid::Uuid::new_v4().to_string();
-        let system_prompt = Self::build_system_prompt(&tools);
+
+        // Register any stored skills as dynamic tools
+        {
+            let mut reg = tools.lock().unwrap();
+            skill_tools::register_skills(&mut reg, &brain);
+        }
+
+        let system_prompt = {
+            let b = brain.lock().unwrap();
+            let reg = tools.lock().unwrap();
+            Self::build_system_prompt(&reg, &b)
+        };
 
         Self {
             llm,
@@ -41,7 +52,24 @@ impl Agent {
         }
     }
 
-    fn build_system_prompt(tools: &ToolRegistry) -> String {
+    fn build_system_prompt(tools: &ToolRegistry, brain: &Brain) -> String {
+        let tools_text = tools.tool_description_text();
+
+        let skills = brain.list_skills();
+        let skills_text = if skills.is_empty() {
+            String::new()
+        } else {
+            let mut s = String::from("\n\n### Previously Learned Skills\n");
+            s.push_str("You have learned the following skills from past evolution cycles. Reference them when relevant:\n");
+            for (name, desc) in &skills {
+                s.push_str(&format!("- **{}**: {}\n", name, desc));
+                if let Some(code) = brain.get_skill_code(name) {
+                    s.push_str(&format!("  ```rust\n  {}\n  ```\n", code));
+                }
+            }
+            s
+        };
+
         format!(
             r#"You are GSEA — a self-evolving Rust engineering agent powered by a local LLM.
 
@@ -57,7 +85,7 @@ Your ultimate goal is to improve your own capabilities over time by:
 3. Reflecting on what works and what doesn't
 4. Generating and applying improvements to your own codebase
 
-{}
+{}{}
 
 When you want to use a tool, respond with a JSON tool call in this format:
 ```json
@@ -66,31 +94,53 @@ When you want to use a tool, respond with a JSON tool call in this format:
 
 The system will execute it and return the result. You can chain multiple tool calls.
 When you're done, provide a final response to the user."#,
-            tools.tool_description_text()
+            tools_text, skills_text
         )
     }
 
     /// Process a single user message — the core agent loop.
     pub async fn process_message(&mut self, user_input: &str) -> Result<String> {
-        // 1. Recall relevant memories
-        let memories = {
-            let brain = self.brain.lock().unwrap();
-            brain.recall(user_input, 5)
-        };
-        let memory_context = if !memories.is_empty() {
-            let lines: Vec<String> = memories
-                .iter()
-                .map(|item| {
-                    format!(
-                        "[{}] (strength: {:.2}) {}",
-                        item.memory_type, item.strength,
-                        &item.content[..item.content.len().min(200)]
-                    )
-                })
-                .collect();
-            format!("\nRelevant memories:\n{}\n", lines.join("\n"))
-        } else {
-            String::new()
+        // 1. Recall relevant memories (embedding-based, with keyword fallback)
+        let memory_context = match self.embedder.embed(user_input).await {
+            Ok(query_emb) => {
+                let brain = self.brain.lock().unwrap();
+                let results = brain.recall_by_similarity(&query_emb, 5, 0.35);
+                if !results.is_empty() {
+                    let lines: Vec<String> = results
+                        .iter()
+                        .map(|(item, score)| {
+                            format!(
+                                "[{}] (sim: {:.2}) {}",
+                                item.memory_type, score,
+                                &item.content[..item.content.len().min(200)]
+                            )
+                        })
+                        .collect();
+                    format!("\nRelevant memories:\n{}\n", lines.join("\n"))
+                } else {
+                    String::new()
+                }
+            }
+            Err(_) => {
+                // Fallback: keyword search
+                let brain = self.brain.lock().unwrap();
+                let results = brain.recall(user_input, 5);
+                if !results.is_empty() {
+                    let lines: Vec<String> = results
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "[{}] (strength: {:.2}) {}",
+                                item.memory_type, item.strength,
+                                &item.content[..item.content.len().min(200)]
+                            )
+                        })
+                        .collect();
+                    format!("\nRelevant memories:\n{}\n", lines.join("\n"))
+                } else {
+                    String::new()
+                }
+            }
         };
 
         // 2. Build the augmented prompt
@@ -106,9 +156,10 @@ When you're done, provide a final response to the user."#,
         });
 
         // 3. Send to Gemma and get response
+        let tool_specs = self.tools.lock().unwrap().tool_specs();
         let response = self
             .llm
-            .chat_with_tools(self.messages.clone(), self.tools.tool_specs())
+            .chat_with_tools(self.messages.clone(), tool_specs)
             .await?;
 
         let response_content = response.message.content.clone();
@@ -124,11 +175,18 @@ When you're done, provide a final response to the user."#,
             response_content
         };
 
-        // 5. Store in memory
+        // 5. Store in memory (with embedding for future similarity search)
         {
-            let mut brain = self.brain.lock().unwrap();
             let content = format!("User: {}\nAssistant: {}", user_input, &final_output[..final_output.len().min(300)]);
-            brain.process(&content, Some(crate::memory_brain::MemoryType::Episodic))?;
+            if let Ok(emb) = self.embedder.embed(&content).await {
+                let mut item = crate::memory_brain::MemoryItem::new(&content, crate::memory_brain::MemoryType::Episodic);
+                item.embedding = Some(emb);
+                let brain = self.brain.lock().unwrap();
+                brain.episodic.store(item)?;
+            } else {
+                let mut brain = self.brain.lock().unwrap();
+                brain.process(&content, Some(crate::memory_brain::MemoryType::Episodic))?;
+            }
         }
 
         Ok(final_output)
@@ -139,11 +197,14 @@ When you're done, provide a final response to the user."#,
         let mut current_tool = first_call;
         loop {
             // Execute the tool
-            let result = match self.tools.get(&current_tool.name) {
-                Some(tool) => tool.execute(current_tool.params.clone()).await,
-                None => Ok(serde_json::json!({
-                    "error": format!("Unknown tool: {}", current_tool.name)
-                })),
+            let result = {
+                let tools = self.tools.lock().unwrap();
+                match tools.get(&current_tool.name) {
+                    Some(tool) => tool.execute(current_tool.params.clone()).await,
+                    None => Ok(serde_json::json!({
+                        "error": format!("Unknown tool: {}", current_tool.name)
+                    })),
+                }
             };
 
             let result_json = match result {
@@ -162,9 +223,10 @@ When you're done, provide a final response to the user."#,
             });
 
             // Get next response from Gemma
+            let tool_specs = self.tools.lock().unwrap().tool_specs();
             let response = self
                 .llm
-                .chat_with_tools(self.messages.clone(), self.tools.tool_specs())
+                .chat_with_tools(self.messages.clone(), tool_specs)
                 .await?;
 
             let response_content = response.message.content.clone();
