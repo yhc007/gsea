@@ -29,8 +29,8 @@ use tools::{
 #[derive(Parser)]
 #[command(name = "gsea", version, about = "Gemma Self-Evolving Agent")]
 struct Cli {
-    /// Main model (gemma4:26b for complex tasks, qwen3:8b for fast response)
-    #[arg(short, long, default_value = "qwen3:8b")]
+    /// Main model
+    #[arg(short, long, default_value = "gemma4:26b")]
     model: String,
 
     /// Ollama base URL

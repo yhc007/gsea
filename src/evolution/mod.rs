@@ -98,15 +98,24 @@ Current system state:
         // Step 3: Extract function name
         let fn_name = self.extract_fn_name(&code).unwrap_or("unnamed_utility");
 
-        // Step 4: Save to file
+        // Step 4: Save to skills/ directory (always)
         let file_path = format!("skills/{}.rs", fn_name);
-        match tokio::fs::write(&file_path, &code).await {
-            Ok(_) => tracing::info!("Saved skill to {}", file_path),
-            Err(e) => {
-                let msg = format!("Failed to save {}: {}", file_path, e);
-                self.brain.lock().unwrap().record_reflection("evolution_result", &msg)?;
-                return Ok(msg);
-            }
+        let _ = tokio::fs::write(&file_path, &code).await;
+
+        // Step 4b: Promote to src/tools/skills/ as a real module + verify build
+        let promoted_path = format!("src/tools/skills/{}.rs", fn_name);
+        let mod_path = "src/tools/skills/mod.rs";
+        let promoted = tokio::fs::write(&promoted_path, &code).await.is_ok()
+            && self.add_skill_module(mod_path, fn_name).await
+            && self.build_project().await;
+
+        if promoted {
+            tracing::info!("Skill '{}' promoted and compiled into project", fn_name);
+        } else {
+            // Rollback on build failure
+            let _ = tokio::fs::remove_file(&promoted_path).await;
+            let _ = self.remove_skill_module(mod_path, fn_name).await;
+            tracing::warn!("Build failed for '{}', rolled back", fn_name);
         }
 
         // Step 5: Store the skill in Brain + filesystem + git
@@ -182,6 +191,44 @@ Current system state:
             }
         }
         None
+    }
+
+    /// Add a `pub mod {name};` line to the skills module.
+    async fn add_skill_module(&self, mod_path: &str, name: &str) -> bool {
+        let line = format!("pub mod {};\n", name);
+        match tokio::fs::read_to_string(mod_path).await {
+            Ok(mut content) => {
+                if !content.contains(&line) {
+                    content.push_str(&line);
+                    tokio::fs::write(mod_path, &content).await.is_ok()
+                } else {
+                    true // already present
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Remove a `pub mod {name};` line from the skills module (for rollback).
+    async fn remove_skill_module(&self, mod_path: &str, name: &str) -> bool {
+        let search = format!("pub mod {};\n", name);
+        match tokio::fs::read_to_string(mod_path).await {
+            Ok(content) => {
+                let new_content = content.replace(&search, "");
+                tokio::fs::write(mod_path, &new_content).await.is_ok()
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Run cargo build to verify the skill compiles.
+    async fn build_project(&self) -> bool {
+        let output = tokio::process::Command::new("cargo")
+            .args(["build", "--message-format=short"])
+            .current_dir(std::env::current_dir().unwrap_or_default())
+            .output()
+            .await;
+        matches!(output, Ok(o) if o.status.success())
     }
 
     async fn git_commit(&self, skill_name: &str) {

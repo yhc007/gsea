@@ -5,6 +5,7 @@ use std::collections::HashMap;
 pub mod file_tools;
 pub mod memory_tools;
 pub mod skill_tools;
+pub mod skills;
 
 /// A tool that the agent can invoke. Each tool has a name, description,
 /// and an `execute` method that takes JSON parameters and returns JSON.
