@@ -25,3 +25,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rustyline = "14"
 atty = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
+eframe = "0.31"
+futures = "0.3.32"

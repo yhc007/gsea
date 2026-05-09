@@ -3,6 +3,7 @@
 
 mod agent;
 mod evolution;
+mod gui;
 mod llm;
 mod mcp_server;
 mod memory_brain;
@@ -117,7 +118,6 @@ async fn main() -> Result<()> {
     if first_arg == Some("serve-mcp") {
         return mcp_server::run_mcp_server(registry, brain).await;
     }
-
     // Initialize embedding engine
     let embedder: Arc<dyn EmbeddingEngine> = Arc::new(OllamaEmbedder::new(
         &cli.ollama_url,
@@ -145,7 +145,9 @@ async fn main() -> Result<()> {
     let mut evolution = EvolutionEngine::new(brain.clone(), registry.clone(), cli.reflect_interval);
 
     // Run mode
-    if cli.interactive {
+    if first_arg == Some("gui") {
+        run_gui(agent, brain, registry, &cli.model).await?;
+    } else if cli.interactive {
         let session_path = cli.session_out.clone();
         run_interactive(&mut agent, &mut evolution).await?;
         // Save session on exit
@@ -221,6 +223,32 @@ async fn run_review(llm: &OllamaClient, rev: &str) -> Result<()> {
     println!("📋 Code Review (diff against {})", rev);
     println!("{}", "-".repeat(50));
     println!("{}", response.content);
+    Ok(())
+}
+
+// ─── GUI Mode ─────────────────────────────────────────────────
+
+async fn run_gui(
+    agent: Agent,
+    brain: Arc<std::sync::Mutex<Brain>>,
+    registry: Arc<std::sync::Mutex<ToolRegistry>>,
+    model: &str,
+) -> Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([960.0, 640.0])
+            .with_title("GSEA — Gemma Self-Evolving Agent"),
+        ..Default::default()
+    };
+
+    let app = gui::GseaGui::new(Some(agent), brain, registry, model);
+    if let Err(e) = eframe::run_native(
+        "GSEA",
+        options,
+        Box::new(|_cc| Ok(Box::new(app))),
+    ) {
+        eprintln!("GUI error: {}", e);
+    }
     Ok(())
 }
 
