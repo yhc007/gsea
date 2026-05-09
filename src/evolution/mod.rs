@@ -52,30 +52,25 @@ impl EvolutionEngine {
         let summary = self.brain.lock().unwrap().generate_context_summary();
         self.brain.lock().unwrap().record_reflection("evolution_cycle", "Starting self-evolution cycle")?;
 
-        // Step 1: Ask Gemma for a utility function
+        // Step 1: Ask Gemma for Rust code
         let code_prompt = format!(
-            r#"Suggest ONE small, standalone Rust utility function that could be useful.
+            r#"Suggest a small, useful Rust code item. Examples:
+- A utility function: pub fn trim_indent(s: &str) -> String {{ ... }}
+- A struct with methods: pub struct Point {{ x: f64, y: f64 }}
+- A trait + blanket impl: pub trait Summary {{ fn summarize(&self) -> String; }}
+- A small module: pub mod math_utils {{ ... }}
 
 Rules:
-- The function must be pure (no external crate dependencies)
-- Max 20 lines of code
-- Include a doc comment explaining what it does
-- Format exactly like this:
+- Max 50 lines, std only, include /// doc comments
+- Format: ```rust ... ```
 
-```rust
-/// Description of the utility
-pub fn my_utility(param: Type) -> ReturnType {{
-    // implementation
-}}
-```
-
-Current system state:
+Current state:
 {}"#,
             summary
         );
 
         let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(60),
             agent.process_message_fast(&code_prompt),
         )
         .await
@@ -170,12 +165,45 @@ Current system state:
     fn extract_fn_name<'a>(&self, code: &'a str) -> Option<&'a str> {
         for line in code.lines() {
             let trimmed = line.trim();
+            // pub fn name(...
             if let Some(rest) = trimmed.strip_prefix("pub fn ") {
                 if let Some(name_end) = rest.find('(') {
                     return Some(&rest[..name_end]);
                 }
-            } else if let Some(rest) = trimmed.strip_prefix("fn ") {
+            }
+            // fn name(...
+            if let Some(rest) = trimmed.strip_prefix("fn ") {
                 if let Some(name_end) = rest.find('(') {
+                    return Some(&rest[..name_end]);
+                }
+            }
+            // pub struct Name
+            if let Some(rest) = trimmed.strip_prefix("pub struct ") {
+                if let Some(name_end) = rest.find(|c: char| !c.is_alphanumeric() && c != '_') {
+                    return Some(&rest[..name_end]);
+                }
+            }
+            // struct Name
+            if let Some(rest) = trimmed.strip_prefix("struct ") {
+                if let Some(name_end) = rest.find(|c: char| !c.is_alphanumeric() && c != '_') {
+                    return Some(&rest[..name_end]);
+                }
+            }
+            // pub trait Name
+            if let Some(rest) = trimmed.strip_prefix("pub trait ") {
+                if let Some(name_end) = rest.find(|c: char| !c.is_alphanumeric() && c != '_') {
+                    return Some(&rest[..name_end]);
+                }
+            }
+            // trait Name
+            if let Some(rest) = trimmed.strip_prefix("trait ") {
+                if let Some(name_end) = rest.find(|c: char| !c.is_alphanumeric() && c != '_') {
+                    return Some(&rest[..name_end]);
+                }
+            }
+            // pub mod name
+            if let Some(rest) = trimmed.strip_prefix("pub mod ") {
+                if let Some(name_end) = rest.find(|c: char| !c.is_alphanumeric() && c != '_') {
                     return Some(&rest[..name_end]);
                 }
             }
@@ -241,15 +269,19 @@ Current system state:
     }
 
     async fn git_commit(&self, skill_name: &str) {
+        let project_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
         let msg = format!("gsea: auto-learned skill '{}'", skill_name);
         let _ = tokio::process::Command::new("git")
             .args(["add", "-A"])
-            .current_dir(std::env::current_dir().unwrap_or_default())
+            .current_dir(&project_dir)
             .output()
             .await;
         let _ = tokio::process::Command::new("git")
             .args(["commit", "-m", &msg])
-            .current_dir(std::env::current_dir().unwrap_or_default())
+            .current_dir(&project_dir)
             .output()
             .await;
     }
@@ -305,9 +337,30 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_fn_name_struct() {
+        let engine = test_engine();
+        let code = "pub struct Config { pub name: String }";
+        assert_eq!(engine.extract_fn_name(code), Some("Config"));
+    }
+
+    #[test]
+    fn test_extract_fn_name_trait() {
+        let engine = test_engine();
+        let code = "pub trait Serialize { fn to_bytes(&self) -> Vec<u8>; }";
+        assert_eq!(engine.extract_fn_name(code), Some("Serialize"));
+    }
+
+    #[test]
+    fn test_extract_fn_name_module() {
+        let engine = test_engine();
+        let code = "pub mod utils { pub fn helper() {} }";
+        assert_eq!(engine.extract_fn_name(code), Some("utils"));
+    }
+
+    #[test]
     fn test_extract_fn_name_none() {
         let engine = test_engine();
-        assert!(engine.extract_fn_name("struct Foo;").is_none());
+        assert!(engine.extract_fn_name("// just a comment").is_none());
     }
 
     #[test]

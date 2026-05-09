@@ -135,6 +135,20 @@ impl Tool for RunShell {
     }
 }
 
+impl GitCommit {
+    /// Resolve the working directory. If "." (default), use the binary's parent.
+    fn resolve_project_dir(dir: &str) -> std::path::PathBuf {
+        if dir == "." {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()))
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        } else {
+            std::path::PathBuf::from(dir)
+        }
+    }
+}
+
 // ─── CargoBuild ─────────────────────────────────────────────────
 
 pub struct CargoBuild;
@@ -267,10 +281,10 @@ impl Tool for GitCommit {
         let msg = params["message"]
             .as_str()
             .context("missing 'message' parameter")?;
-        let project_dir = params["project_dir"]
-            .as_str()
-            .unwrap_or(".")
-            .to_string();
+
+        let project_dir = Self::resolve_project_dir(
+            params["project_dir"].as_str().unwrap_or(".")
+        );
 
         let add_output = tokio::process::Command::new("git")
             .args(["add", "-A"])

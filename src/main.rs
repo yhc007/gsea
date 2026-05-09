@@ -4,6 +4,7 @@
 mod agent;
 mod evolution;
 mod llm;
+mod mcp_server;
 mod memory_brain;
 mod tools;
 
@@ -90,21 +91,7 @@ async fn main() -> Result<()> {
     let fast_llm = OllamaClient::new(&cli.ollama_url, &cli.fast_model);
     tracing::info!("Main model: {}, Fast model: {}", cli.model, cli.fast_model);
 
-    // Check for "review" subcommand (before creating agent, since review doesn't need one)
-    let is_review = cli.prompt.first().map(|s| s == "review").unwrap_or(false);
-    if is_review {
-        let rev = cli.prompt.get(1).cloned().unwrap_or_else(|| "HEAD~1".to_string());
-        return run_review(&llm, &rev).await;
-    }
-
-    // Initialize embedding engine
-    let embedder: Arc<dyn EmbeddingEngine> = Arc::new(OllamaEmbedder::new(
-        &cli.ollama_url,
-        &cli.embed_model,
-    ));
-    tracing::info!("Embedding engine initialized with model: {}", cli.embed_model);
-
-    // Build tool registry (shared between Agent and EvolutionEngine)
+    // Build tool registry early (needed by serve-mcp and review)
     let registry = Arc::new(std::sync::Mutex::new(ToolRegistry::new()));
     {
         let mut reg = registry.lock().unwrap();
@@ -120,6 +107,23 @@ async fn main() -> Result<()> {
         reg.register(Box::new(memory_tools::Reflect::new(brain.clone())));
         reg.register(Box::new(skill_tools::CallSkill::new(brain.clone())));
     }
+
+    // Check for subcommands that don't need an agent
+    let first_arg = cli.prompt.first().map(|s| s.as_str());
+    if first_arg == Some("review") {
+        let rev = cli.prompt.get(1).cloned().unwrap_or_else(|| "HEAD~1".to_string());
+        return run_review(&llm, &rev).await;
+    }
+    if first_arg == Some("serve-mcp") {
+        return mcp_server::run_mcp_server(registry, brain).await;
+    }
+
+    // Initialize embedding engine
+    let embedder: Arc<dyn EmbeddingEngine> = Arc::new(OllamaEmbedder::new(
+        &cli.ollama_url,
+        &cli.embed_model,
+    ));
+    tracing::info!("Embedding engine initialized with model: {}", cli.embed_model);
 
     tracing::info!(
         "GSEA initialized with {} tools (startup)",
