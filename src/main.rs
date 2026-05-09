@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
         let rev = cli.prompt.get(1).cloned().unwrap_or_else(|| "HEAD~1".to_string());
         return run_review(&llm, &rev).await;
     }
-    if first_arg == Some("serve-mcp") {
+    if first_arg == Some("serve-mcp") || first_arg == Some("server-mcp") {
         return mcp_server::run_mcp_server(registry, brain).await;
     }
     // Initialize embedding engine
