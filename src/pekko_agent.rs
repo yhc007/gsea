@@ -79,7 +79,7 @@ impl GseaPekkoAgent {
 
     /// Create a new `GseaPekkoAgent` with a specific role.
     pub fn new_with_role(id: &str, role: &str, agent: Agent) -> Self {
-        // Snapshot tool definitions from the registry.
+        // Snapshot tool definitions before moving agent into the Arc.
         let tool_defs: Vec<ToolDefinition> = {
             let registry = agent.tools.lock().expect("tool registry lock poisoned");
             registry
@@ -95,12 +95,30 @@ impl GseaPekkoAgent {
                 })
                 .collect()
         };
+        let agent_arc = Arc::new(Mutex::new(Some(agent)));
+        Self::new_with_shared_agent(id, role, agent_arc, tool_defs)
+    }
 
+    /// Create a new `GseaPekkoAgent` with a pre-built shared agent Arc and
+    /// pre-computed tool definitions.
+    ///
+    /// This allows external code (e.g. streaming workflows) to hold a clone
+    /// of the `Arc<Mutex<Option<Agent>>>` and temporarily borrow the agent
+    /// for streaming calls, while the actor system owns the `GseaPekkoAgent`.
+    ///
+    /// Tool definitions must be extracted before calling this (to avoid
+    /// blocking inside a tokio runtime).
+    pub fn new_with_shared_agent(
+        id: &str,
+        role: &str,
+        agent_arc: Arc<Mutex<Option<Agent>>>,
+        tool_defs: Vec<ToolDefinition>,
+    ) -> Self {
         Self {
             id: id.to_string(),
             role: role.to_string(),
             state: AgentState::Idle,
-            agent: Arc::new(Mutex::new(Some(agent))),
+            agent: agent_arc,
             tool_defs,
             events: EventPublisher::new("agent-events", 100),
         }

@@ -546,9 +546,12 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
         reg
     };
 
-    // Store agent refs for delegation
+    // Store agent refs for delegation and shared agent arcs for streaming
     let mut agent_refs: std::collections::HashMap<String, ActorRef<AgentMessage>> = std::collections::HashMap::new();
     agent_refs.insert("gsea-main".to_string(), main_ref.clone());
+
+    // Shared agent Arcs — allows streaming access to agents outside the actor system
+    let mut agent_arcs: std::collections::HashMap<String, SharedAgent> = std::collections::HashMap::new();
 
     let roles = [("gsea-coder", "coder"), ("gsea-reviewer", "reviewer"), ("gsea-tester", "tester")];
     let cli = Cli::parse();
@@ -564,7 +567,28 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
         );
         role_agent.set_system_prompt(role_system_prompt(role));
 
-        let pekko_agent = GseaPekkoAgent::new_with_role(agent_id, role, role_agent);
+        // Snapshot tool definitions before moving agent into the Arc
+        let tool_defs: Vec<pekko_agent_core::ToolDefinition> = {
+            let registry = role_agent.tools.lock().expect("tool registry lock poisoned");
+            registry
+                .list_tools()
+                .into_iter()
+                .map(|t| pekko_agent_core::ToolDefinition {
+                    name: t.name().to_string(),
+                    description: t.description().to_string(),
+                    input_schema: t.parameters(),
+                    required_permissions: vec![],
+                    timeout_ms: 30_000,
+                    idempotent: false,
+                })
+                .collect()
+        };
+
+        // Create shared Arc so we can stream from the agent outside the actor system
+        let agent_arc: SharedAgent = Arc::new(tokio::sync::Mutex::new(Some(role_agent)));
+        agent_arcs.insert(agent_id.to_string(), agent_arc.clone());
+
+        let pekko_agent = GseaPekkoAgent::new_with_shared_agent(agent_id, role, agent_arc, tool_defs);
         let actor_ref = system.spawn(pekko_agent, agent_id).await?;
         tracing::info!(actor = %actor_ref.name(), role = %role, "Specialized agent spawned");
 
@@ -749,7 +773,7 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                             if let Some((_desc, steps_json)) = template {
                                 run_template_workflow(
                                     template_name, task_desc, &steps_json,
-                                    &agent_refs, &orch_ref, &brain_ref,
+                                    &agent_arcs, &orch_ref, &brain_ref,
                                 ).await?;
                             } else {
                                 println!("Unknown template: {}", template_name);
@@ -786,7 +810,7 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                         }
 
                         // Default: run the built-in coder→reviewer→tester pipeline
-                        run_workflow(rest, &agent_refs, &orch_ref, &brain_ref).await?;
+                        run_workflow(rest, &agent_arcs, &orch_ref, &brain_ref).await?;
                         continue;
                     }
                     cmd if cmd.starts_with("/history") => {
@@ -947,22 +971,69 @@ fn make_query(input: &str) -> UserQuery {
     }
 }
 
-/// Execute a coder → reviewer → tester workflow pipeline.
+/// Type alias for shared agent arcs used by streaming workflows.
+type SharedAgent = Arc<tokio::sync::Mutex<Option<Agent>>>;
+
+/// Run a streaming workflow step: temporarily borrow the agent from its shared
+/// Arc, call `process_message_stream`, print chunks in real-time, and return
+/// the full collected response.
+///
+/// Falls back to `process_message` (non-streaming) if the stream fails.
+async fn run_streaming_step(
+    agent_arc: &SharedAgent,
+    prompt: &str,
+) -> Result<String> {
+    // Take the agent out of the Arc temporarily
+    let mut agent = {
+        let mut guard = agent_arc.lock().await;
+        guard.take().ok_or_else(|| anyhow::anyhow!("agent slot is empty (busy?)"))?
+    };
+
+    // Try streaming first, fall back to non-streaming
+    let result = match agent.process_message_stream(prompt).await {
+        Ok(mut rx) => {
+            let mut full_response = String::new();
+            while let Some(chunk) = rx.recv().await {
+                print!("{}", chunk);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                full_response.push_str(&chunk);
+            }
+            println!(); // newline after stream completes
+            Ok(full_response)
+        }
+        Err(stream_err) => {
+            eprintln!("(stream failed: {}, using non-streaming…)", stream_err);
+            agent.process_message(prompt).await
+        }
+    };
+
+    // Restore the agent to its slot
+    {
+        let mut guard = agent_arc.lock().await;
+        *guard = Some(agent);
+    }
+
+    result
+}
+
+/// Execute a coder → reviewer → tester workflow pipeline with streaming output.
 ///
 /// 1. **Coder** receives the task and produces code/implementation
 /// 2. **Reviewer** receives the coder's output and reviews it
 /// 3. **Tester** receives both outputs and writes/runs tests
 ///
-/// Each step's output is passed as context to the next step.
+/// Each step streams tokens in real-time as they arrive from the LLM.
+/// Each step's full output is passed as context to the next step.
 /// The workflow is tracked via the OrchestratorActor.
 async fn run_workflow(
     task_desc: &str,
-    agent_refs: &std::collections::HashMap<String, ActorRef<AgentMessage>>,
+    agent_arcs: &std::collections::HashMap<String, SharedAgent>,
     orch_ref: &ActorRef<OrchestratorMessage>,
     brain_ref: &Arc<std::sync::Mutex<Brain>>,
 ) -> Result<()> {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("Workflow: coder → reviewer → tester");
+    println!("Workflow: coder → reviewer → tester (streaming)");
     println!("Task: {}", task_desc);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
@@ -1002,7 +1073,7 @@ async fn run_workflow(
     let workflow_id = workflow.id;
     orch_ref.tell(OrchestratorMessage::CreateWorkflow(workflow)).await?;
 
-    // Pipeline steps: (agent_id, step_label, prompt_builder)
+    // Pipeline steps: (agent_id, step_label)
     let steps: Vec<(&str, &str)> = vec![
         ("gsea-coder", "Step 1/3: Coder"),
         ("gsea-reviewer", "Step 2/3: Reviewer"),
@@ -1015,8 +1086,8 @@ async fn run_workflow(
     for (i, (agent_id, label)) in steps.iter().enumerate() {
         println!("\n── {} ──────────────────────────────────", label);
 
-        let agent_ref = match agent_refs.get(*agent_id) {
-            Some(r) => r,
+        let agent_arc = match agent_arcs.get(*agent_id) {
+            Some(a) => a,
             None => {
                 eprintln!("Agent {} not found, aborting workflow", agent_id);
                 failed = true;
@@ -1026,44 +1097,35 @@ async fn run_workflow(
 
         // Build the prompt with context from previous steps
         let prompt = match i {
-            0 => {
-                // Coder: just the task
-                format!(
-                    "Task: {}\n\n\
-                     Write the implementation for this task. \
-                     Produce complete, compilable Rust code. \
-                     Explain your approach briefly, then show the code.",
-                    task_desc
-                )
-            }
-            1 => {
-                // Reviewer: task + coder output
-                format!(
-                    "Original task: {}\n\n\
-                     --- Coder's output ---\n{}\n\
-                     --- End of coder's output ---\n\n\
-                     Review the code above for:\n\
-                     1. Correctness and potential bugs\n\
-                     2. Safety issues (unwrap, unsafe, panics)\n\
-                     3. Performance concerns\n\
-                     4. Idiomatic Rust style\n\
-                     Be specific and actionable.",
-                    task_desc, step_outputs[0]
-                )
-            }
-            2 => {
-                // Tester: task + coder output + reviewer feedback
-                format!(
-                    "Original task: {}\n\n\
-                     --- Coder's output ---\n{}\n\
-                     --- Reviewer's feedback ---\n{}\n\
-                     --- End ---\n\n\
-                     Write comprehensive tests for the implementation above.\n\
-                     Cover: happy path, edge cases, error paths.\n\
-                     Show the test code and describe what each test verifies.",
-                    task_desc, step_outputs[0], step_outputs[1]
-                )
-            }
+            0 => format!(
+                "Task: {}\n\n\
+                 Write the implementation for this task. \
+                 Produce complete, compilable Rust code. \
+                 Explain your approach briefly, then show the code.",
+                task_desc
+            ),
+            1 => format!(
+                "Original task: {}\n\n\
+                 --- Coder's output ---\n{}\n\
+                 --- End of coder's output ---\n\n\
+                 Review the code above for:\n\
+                 1. Correctness and potential bugs\n\
+                 2. Safety issues (unwrap, unsafe, panics)\n\
+                 3. Performance concerns\n\
+                 4. Idiomatic Rust style\n\
+                 Be specific and actionable.",
+                task_desc, step_outputs[0]
+            ),
+            2 => format!(
+                "Original task: {}\n\n\
+                 --- Coder's output ---\n{}\n\
+                 --- Reviewer's feedback ---\n{}\n\
+                 --- End ---\n\n\
+                 Write comprehensive tests for the implementation above.\n\
+                 Cover: happy path, edge cases, error paths.\n\
+                 Show the test code and describe what each test verifies.",
+                task_desc, step_outputs[0], step_outputs[1]
+            ),
             _ => unreachable!(),
         };
 
@@ -1077,22 +1139,9 @@ async fn run_workflow(
             timeout_ms: 120_000,
         })).await?;
 
-        // Send to agent via ask()
-        let query = make_query(&prompt);
-        let response = agent_ref.ask(
-            |reply_tx| AgentMessage::QueryWithReply(query, reply_tx),
-            std::time::Duration::from_secs(120),
-        ).await;
-
-        match response {
-            Ok(Ok(text)) => {
-                // Truncate display but keep full text for context passing
-                let display: String = text.chars().take(2000).collect();
-                println!("{}", display);
-                if text.len() > 2000 {
-                    println!("... ({} chars total)", text.len());
-                }
-
+        // Stream the response from the agent
+        match run_streaming_step(agent_arc, &prompt).await {
+            Ok(text) => {
                 orch_ref.tell(OrchestratorMessage::CompleteTask {
                     task_id,
                     result: serde_json::json!({ "status": "ok" }),
@@ -1110,17 +1159,12 @@ async fn run_workflow(
 
                 step_outputs.push(text);
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 eprintln!("[{}] Error: {}", agent_id, e);
                 orch_ref.tell(OrchestratorMessage::FailTask {
                     task_id,
-                    error: e,
+                    error: e.to_string(),
                 }).await?;
-                failed = true;
-                break;
-            }
-            Err(e) => {
-                eprintln!("[{}] Communication error: {}", agent_id, e);
                 failed = true;
                 break;
             }
@@ -1144,7 +1188,7 @@ async fn run_workflow(
     Ok(())
 }
 
-/// Execute a named workflow template loaded from Brain.
+/// Execute a named workflow template loaded from Brain, with streaming output.
 ///
 /// Template steps are stored as JSON:
 /// ```json
@@ -1162,7 +1206,7 @@ async fn run_template_workflow(
     template_name: &str,
     task_desc: &str,
     steps_json: &str,
-    agent_refs: &std::collections::HashMap<String, ActorRef<AgentMessage>>,
+    agent_arcs: &std::collections::HashMap<String, SharedAgent>,
     orch_ref: &ActorRef<OrchestratorMessage>,
     brain_ref: &Arc<std::sync::Mutex<Brain>>,
 ) -> Result<()> {
@@ -1177,7 +1221,7 @@ async fn run_template_workflow(
         .map_err(|e| anyhow::anyhow!("Invalid template JSON: {}", e))?;
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("Template: {} ({} steps)", template_name, steps.len());
+    println!("Template: {} ({} steps, streaming)", template_name, steps.len());
     println!("Task: {}", task_desc);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
@@ -1191,8 +1235,8 @@ async fn run_template_workflow(
         let label = format!("Step {}/{}: {} ({})", i + 1, total, step.step_id, step.agent);
         println!("\n── {} ──────────────────────────────────", label);
 
-        let agent_ref = match agent_refs.get(&step.agent) {
-            Some(r) => r,
+        let agent_arc = match agent_arcs.get(&step.agent) {
+            Some(a) => a,
             None => {
                 eprintln!("Agent {} not found, aborting workflow", step.agent);
                 failed = true;
@@ -1222,21 +1266,9 @@ async fn run_template_workflow(
             timeout_ms: 120_000,
         })).await?;
 
-        // Send to agent
-        let query = make_query(&prompt);
-        let response = agent_ref.ask(
-            |reply_tx| AgentMessage::QueryWithReply(query, reply_tx),
-            std::time::Duration::from_secs(120),
-        ).await;
-
-        match response {
-            Ok(Ok(text)) => {
-                let display: String = text.chars().take(2000).collect();
-                println!("{}", display);
-                if text.len() > 2000 {
-                    println!("... ({} chars total)", text.len());
-                }
-
+        // Stream the response
+        match run_streaming_step(agent_arc, &prompt).await {
+            Ok(text) => {
                 orch_ref.tell(OrchestratorMessage::CompleteTask {
                     task_id,
                     result: serde_json::json!({ "status": "ok" }),
@@ -1254,17 +1286,12 @@ async fn run_template_workflow(
 
                 step_outputs.push(text);
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 eprintln!("[{}] Error: {}", step.agent, e);
                 orch_ref.tell(OrchestratorMessage::FailTask {
                     task_id,
-                    error: e,
+                    error: e.to_string(),
                 }).await?;
-                failed = true;
-                break;
-            }
-            Err(e) => {
-                eprintln!("[{}] Communication error: {}", step.agent, e);
                 failed = true;
                 break;
             }
