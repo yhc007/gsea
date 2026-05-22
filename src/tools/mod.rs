@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 pub mod file_tools;
 pub mod memory_tools;
+pub mod pekko_adapter;
 pub mod skill_tools;
 pub mod skills;
 

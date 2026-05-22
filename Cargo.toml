@@ -34,3 +34,6 @@ pekko-agent-memory = { path = "../pekko-agent/crates/pekko-agent-memory" }
 pekko-agent-tools = { path = "../pekko-agent/crates/pekko-agent-tools" }
 pekko-agent-orchestrator = { path = "../pekko-agent/crates/pekko-agent-orchestrator" }
 pekko-agent-events = { path = "../pekko-agent/crates/pekko-agent-events" }
+
+[dev-dependencies]
+tempfile = "3"
