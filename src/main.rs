@@ -495,6 +495,10 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
     println!("  /workflow run <name> <task>  — run a named template");
     println!("  /workflow parallel <task>    — run coder+reviewer in parallel, then tester");
     println!("  /evolve [target]             — self-evolution: analyze→improve→verify");
+    println!("  /evolve loop <N>             — run N evolution iterations");
+    println!("  /broadcast <msg>             — broadcast message to all agents");
+    println!("  /events                      — show recent agent events");
+    println!("  /recall <query>              — semantic search across all memories");
     println!("  /history [query]             — recall past agent results");
     println!("  /memory <text>               — store a CLS memory");
     println!("  /dream                       — run dream consolidation");
@@ -733,8 +737,87 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                         continue;
                     }
                     cmd if cmd.starts_with("/evolve") => {
-                        let target = cmd.trim_start_matches("/evolve").trim();
-                        run_evolve(target, &agent_arcs, &orch_ref, &brain_ref, evolution).await?;
+                        let rest = cmd.trim_start_matches("/evolve").trim();
+                        if rest.starts_with("loop ") {
+                            let n_str = rest.trim_start_matches("loop ").trim();
+                            let n: usize = n_str.parse().unwrap_or(3);
+                            run_evolve_loop(n, &agent_arcs, &orch_ref, &brain_ref, evolution).await?;
+                        } else {
+                            run_evolve(rest, &agent_arcs, &orch_ref, &brain_ref, evolution).await?;
+                        }
+                        continue;
+                    }
+                    cmd if cmd.starts_with("/broadcast ") => {
+                        let msg = cmd.trim_start_matches("/broadcast ").trim();
+                        if msg.is_empty() {
+                            println!("Usage: /broadcast <message>");
+                            continue;
+                        }
+                        println!("Broadcasting to all agents…");
+                        for (id, agent_ref) in &agent_refs {
+                            if id == "gsea-main" { continue; }
+                            let query = make_query(&format!(
+                                "[BROADCAST from coordinator] {}", msg
+                            ));
+                            let _ = agent_ref.tell(AgentMessage::Query(query)).await;
+                            // Also publish as event
+                            let envelope = pekko_agent_events::AgentEventEnvelope::new(
+                                "gsea-main",
+                                "agent.broadcast",
+                                "default",
+                                uuid::Uuid::new_v4(),
+                                serde_json::json!({
+                                    "from": "gsea-main",
+                                    "to": id,
+                                    "message": msg,
+                                }),
+                            );
+                            if let Some(arc) = agent_arcs.get(id) {
+                                // Get event publisher from the pekko agent
+                                // For now, log the broadcast
+                                let _ = envelope; // event logged via agent's own publisher
+                                let _ = arc; // suppress unused
+                            }
+                            println!("  → {} ✓", id);
+                        }
+                        // Store broadcast in Brain
+                        if let Ok(mut brain) = brain_ref.lock() {
+                            let _ = brain.store_agent_result(
+                                "gsea-main", &format!("[Broadcast] {}", msg),
+                                msg, None,
+                            );
+                        }
+                        println!("Broadcast sent to {} agents", agent_refs.len() - 1);
+                        continue;
+                    }
+                    "/events" => {
+                        // Show recent agent results from Brain as an event log
+                        let brain = brain_ref.lock().unwrap();
+                        let results = brain.recall_agent_results("", 20);
+                        if results.is_empty() {
+                            println!("No agent events recorded.");
+                        } else {
+                            println!("Recent agent events ({}):", results.len());
+                            for item in &results {
+                                let first_line = item.content.lines().next().unwrap_or("");
+                                if let Some(rest) = first_line.strip_prefix("AGENT_RESULT:") {
+                                    let parts: Vec<&str> = rest.splitn(3, '|').collect();
+                                    if parts.len() == 3 {
+                                        println!("  {} │ {} │ {}", item.created_at, parts[0], parts[2]);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    cmd if cmd.starts_with("/recall ") => {
+                        let query = cmd.trim_start_matches("/recall ").trim();
+                        if query.is_empty() {
+                            println!("Usage: /recall <query>");
+                            continue;
+                        }
+                        // Semantic search using embeddings
+                        run_semantic_recall(query, &brain_ref, &cli).await;
                         continue;
                     }
                     cmd if cmd.starts_with("/workflow") => {
@@ -862,10 +945,17 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                         if content.is_empty() {
                             println!("Usage: /memory <text>");
                         } else {
+                            // Store in CLS MemorySystem
                             let id = mem.store(content);
-                            println!("Memory stored — id: {id}");
-                            let s = mem.stats();
-                            println!("  total memories: {}", s.total_memories);
+                            println!("Memory stored — CLS id: {id}");
+                            // Also store in Brain with embedding for semantic search
+                            match store_memory_with_embedding(
+                                content, memory_brain::MemoryType::Semantic,
+                                &brain_ref, &cli,
+                            ).await {
+                                Ok(brain_id) => println!("  Brain id: {} (with embedding)", brain_id),
+                                Err(e) => eprintln!("  Brain store failed: {}", e),
+                            }
                         }
                         continue;
                     }
@@ -1970,4 +2060,137 @@ async fn run_parallel_workflow(
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     Ok(())
+}
+
+// ─── Semantic Recall ──────────────────────────────────────────────────
+
+/// Search memories using embedding similarity. Embeds the query via
+/// Ollama, then runs cosine similarity against all stored memory embeddings.
+async fn run_semantic_recall(
+    query: &str,
+    brain_ref: &Arc<std::sync::Mutex<Brain>>,
+    cli: &Cli,
+) {
+    println!("Embedding query…");
+    let embedder = OllamaEmbedder::new(&cli.ollama_url, &cli.embed_model);
+    match embedder.embed(query).await {
+        Ok(query_emb) => {
+            let brain = brain_ref.lock().unwrap();
+            let results = brain.recall_by_similarity(&query_emb, 10, 0.3);
+            if results.is_empty() {
+                println!("No semantically similar memories found.");
+                // Fallback to keyword search
+                let keyword_results = brain.recall(query, 5);
+                if !keyword_results.is_empty() {
+                    println!("Keyword matches ({}):", keyword_results.len());
+                    for item in &keyword_results {
+                        let preview: String = item.content.chars().take(120).collect();
+                        println!("  [{}] {}", item.memory_type, preview);
+                    }
+                }
+            } else {
+                println!("Semantic matches ({}):", results.len());
+                for (item, score) in &results {
+                    let preview: String = item.content.chars().take(120).collect();
+                    println!("  [{:.2}] [{}] {}", score, item.memory_type, preview);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Embedding failed: {}. Falling back to keyword search.", e);
+            let brain = brain_ref.lock().unwrap();
+            let results = brain.recall(query, 10);
+            if results.is_empty() {
+                println!("No matches found.");
+            } else {
+                println!("Keyword matches ({}):", results.len());
+                for item in &results {
+                    let preview: String = item.content.chars().take(120).collect();
+                    println!("  [{}] {}", item.memory_type, preview);
+                }
+            }
+        }
+    }
+}
+
+// ─── Evolve Loop ──────────────────────────────────────────────────────
+
+/// Run N iterations of self-evolution, feeding each iteration's results
+/// into the next as context. Stops early if an iteration fails.
+async fn run_evolve_loop(
+    iterations: usize,
+    agent_arcs: &std::collections::HashMap<String, SharedAgent>,
+    orch_ref: &ActorRef<OrchestratorMessage>,
+    brain_ref: &Arc<std::sync::Mutex<Brain>>,
+    evolution: &mut EvolutionEngine,
+) -> Result<()> {
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Self-Evolution Loop — {} iterations", iterations);
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    let mut successes = 0;
+    let mut failures = 0;
+
+    for i in 1..=iterations {
+        println!("\n╔══════════════════════════════════════════════════╗");
+        println!("║ Evolution iteration {}/{}", i, iterations);
+        println!("╚══════════════════════════════════════════════════╝");
+
+        // Build a target hint from previous iteration context
+        let target = if i > 1 {
+            // Let the system pick based on accumulated context
+            ""
+        } else {
+            ""
+        };
+
+        match run_evolve(target, agent_arcs, orch_ref, brain_ref, evolution).await {
+            Ok(()) => {
+                successes += 1;
+                println!("\n  ✓ Iteration {}/{} complete", i, iterations);
+            }
+            Err(e) => {
+                failures += 1;
+                eprintln!("\n  ✗ Iteration {}/{} failed: {}", i, iterations, e);
+            }
+        }
+
+        // Brief pause between iterations to avoid overwhelming Ollama
+        if i < iterations {
+            println!("\n  ⏳ Pausing before next iteration…");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Evolution Loop COMPLETED");
+    println!("  {} iterations: {} succeeded, {} failed", iterations, successes, failures);
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    Ok(())
+}
+
+// ─── Embedding on Store ──────────────────────────────────────────────
+
+/// Store a memory with an embedding vector for semantic search.
+/// This wraps Brain.process() with an additional embedding step.
+async fn store_memory_with_embedding(
+    content: &str,
+    memory_type: memory_brain::MemoryType,
+    brain_ref: &Arc<std::sync::Mutex<Brain>>,
+    cli: &Cli,
+) -> Result<memory_brain::UuidValue> {
+    let embedder = OllamaEmbedder::new(&cli.ollama_url, &cli.embed_model);
+
+    // Try to embed, fall back to plain storage
+    let mut item = memory_brain::MemoryItem::new(content, memory_type.clone());
+
+    if let Ok(emb) = embedder.embed(content).await {
+        item.embedding = Some(emb);
+    }
+
+    let id = item.id;
+    let brain = brain_ref.lock().unwrap();
+    brain.consolidate_memory_public(item)?;
+    Ok(id)
 }

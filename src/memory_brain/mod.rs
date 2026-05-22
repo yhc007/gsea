@@ -88,6 +88,17 @@ impl Brain {
         results
     }
 
+    /// Store a memory item to the appropriate long-term storage.
+    pub fn consolidate_memory_public(&self, item: MemoryItem) -> Result<(), anyhow::Error> {
+        match item.memory_type {
+            MemoryType::Episodic => self.episodic.store(item)?,
+            MemoryType::Semantic => self.semantic.store(item)?,
+            MemoryType::Procedural => self.procedural.store(item)?,
+            MemoryType::Working => { /* stays in working memory only */ }
+        }
+        Ok(())
+    }
+
     /// Store to memory and consolidate (internal helper).
     fn consolidate_memory(&mut self, item: MemoryItem) -> Result<(), anyhow::Error> {
         match item.memory_type {
