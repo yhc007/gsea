@@ -147,14 +147,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Create evolution engine
-    let mut evolution = EvolutionEngine::new(brain.clone(), registry.clone(), cli.reflect_interval);
+    // Create evolution engine (uses its own fast LLM client)
+    let fast_llm_evo = OllamaClient::new(&cli.ollama_url, &cli.fast_model);
+    let mut evolution = EvolutionEngine::new(brain.clone(), registry.clone(), fast_llm_evo, cli.reflect_interval);
 
     // Run mode
     if first_arg == Some("gui") {
         run_gui(agent, brain, registry, &cli.model).await?;
     } else if first_arg == Some("pekko") {
-        run_pekko(agent).await?;
+        run_pekko(agent, &mut evolution).await?;
     } else if cli.interactive {
         let session_path = cli.session_out.clone();
         run_interactive(&mut agent, &mut evolution).await?;
@@ -270,7 +271,7 @@ async fn run_one_shot(
     let response = agent.process_message(prompt).await?;
     println!("{}", response);
 
-    evolution.after_episode(agent).await?;
+    evolution.after_episode().await?;
     Ok(())
 }
 
@@ -347,11 +348,27 @@ async fn run_interactive(
 
                 rl.add_history_entry(&line)?;
 
-                let response = agent.process_message(&line).await?;
-                println!("\n{}", response);
-                println!();
+                // Stream response token by token
+                print!("\n");
+                match agent.process_message_stream(&line).await {
+                    Ok(mut rx) => {
+                        while let Some(chunk) = rx.recv().await {
+                            print!("{}", chunk);
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
+                        }
+                        println!("\n");
+                    }
+                    Err(e) => {
+                        // Fallback to non-streaming on error
+                        eprintln!("Stream error ({}), using non-streaming...", e);
+                        let response = agent.process_message(&line).await?;
+                        println!("{}", response);
+                        println!();
+                    }
+                }
 
-                evolution.after_episode(agent).await?;
+                evolution.after_episode().await?;
             }
             Err(rustyline::error::ReadlineError::Interrupted)
             | Err(rustyline::error::ReadlineError::Eof) => {
@@ -377,7 +394,7 @@ async fn run_interactive(
 /// Extra REPL commands:
 ///   `/memory <text>` — store `<text>` as a CLS episodic memory
 ///   `/dream`         — run one offline consolidation pass
-async fn run_pekko(agent: Agent) -> Result<()> {
+async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> {
     println!("GSEA Pekko Mode — ActorSystem starting…");
     println!("  Type 'exit' or 'quit' to stop");
     println!("  /memory <text>  — store a CLS memory");
@@ -479,6 +496,11 @@ async fn run_pekko(agent: Agent) -> Result<()> {
                     Err(e) => {
                         eprintln!("Communication error: {}", e);
                     }
+                }
+
+                // Trigger evolution cycle if interval reached
+                if let Ok(Some(evo_result)) = evolution.after_episode().await {
+                    println!("\n🧬 Evolution: {}", evo_result);
                 }
             }
             Err(rustyline::error::ReadlineError::Interrupted)

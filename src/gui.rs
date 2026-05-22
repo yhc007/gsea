@@ -17,7 +17,8 @@ struct ChatMessage {
 }
 
 enum GuiEvent {
-    Response(String),
+    StreamChunk(String),
+    StreamDone,
     Error(String),
     StatsUpdate(String, usize), // (brain_stats_json, tool_count)
 }
@@ -79,9 +80,15 @@ impl GseaGui {
                 Ok(rt) => {
                     let mut ag = agent.lock().unwrap();
                     if let Some(ref mut a) = *ag {
-                        match rt.block_on(a.process_message(&input)) {
-                            Ok(r) => {
-                                let _ = tx.send(GuiEvent::Response(r));
+                        match rt.block_on(a.process_message_stream(&input)) {
+                            Ok(mut rx) => {
+                                // Forward streaming chunks to GUI
+                                rt.block_on(async {
+                                    while let Some(chunk) = rx.recv().await {
+                                        let _ = tx.send(GuiEvent::StreamChunk(chunk));
+                                    }
+                                });
+                                let _ = tx.send(GuiEvent::StreamDone);
                             }
                             Err(e) => {
                                 let _ = tx.send(GuiEvent::Error(e.to_string()));
@@ -119,8 +126,19 @@ impl eframe::App for GseaGui {
         // Drain pending events from the channel
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                GuiEvent::Response(text) => {
-                    self.messages.push(ChatMessage { role: "GSEA".into(), content: text });
+                GuiEvent::StreamChunk(chunk) => {
+                    // Append to the last GSEA message or create a new one
+                    if let Some(last) = self.messages.last_mut() {
+                        if last.role == "GSEA" && self.is_processing {
+                            last.content.push_str(&chunk);
+                        } else {
+                            self.messages.push(ChatMessage { role: "GSEA".into(), content: chunk });
+                        }
+                    } else {
+                        self.messages.push(ChatMessage { role: "GSEA".into(), content: chunk });
+                    }
+                }
+                GuiEvent::StreamDone => {
                     self.is_processing = false;
                 }
                 GuiEvent::Error(text) => {

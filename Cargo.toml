@@ -24,6 +24,7 @@ async-trait = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 rustyline = "14"
 chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
 eframe = "0.31"
 
 # pekko-agent dependencies

@@ -1,6 +1,7 @@
 pub mod embedding;
 
 use anyhow::Result;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -106,6 +107,65 @@ impl OllamaClient {
 
         let chat_resp: ChatResponse = resp.json().await?;
         Ok(chat_resp)
+    }
+
+    /// Send a streaming chat request. Returns an mpsc Receiver that yields
+    /// content chunks as they arrive. The final empty string signals completion.
+    pub async fn chat_stream(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<tokio::sync::mpsc::Receiver<String>> {
+        let body = ChatRequest {
+            model: self.model.clone(),
+            messages,
+            stream: true,
+            tools: None,
+        };
+
+        let resp = self
+            .client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&body)
+            .send()
+            .await?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+
+        tokio::spawn(async move {
+            let mut stream = resp.bytes_stream();
+            let mut buf = String::new();
+
+            while let Some(chunk) = stream.next().await {
+                let bytes = match chunk {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+
+                // Process complete lines (newline-delimited JSON)
+                while let Some(newline_pos) = buf.find('\n') {
+                    let line = buf[..newline_pos].trim().to_string();
+                    buf = buf[newline_pos + 1..].to_string();
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    if let Ok(partial) = serde_json::from_str::<ChatResponse>(&line) {
+                        if !partial.message.content.is_empty() {
+                            if tx.send(partial.message.content).await.is_err() {
+                                return; // receiver dropped
+                            }
+                        }
+                        if partial.done {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
     }
 
     /// Generate embeddings using Ollama's embedding endpoint.

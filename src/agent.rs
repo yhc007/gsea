@@ -194,6 +194,123 @@ When you're done, provide a final response to the user."#,
         &mut self.fast_llm
     }
 
+    /// Process a message with streaming output. Returns an mpsc Receiver that
+    /// yields content chunks as they arrive. Memory recall and tool execution
+    /// happen normally; only the final LLM response is streamed.
+    ///
+    /// If the LLM response contains a tool call, streaming stops and the tool
+    /// chain executes non-streaming. The final tool result is sent as a single chunk.
+    pub async fn process_message_stream(
+        &mut self,
+        user_input: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<String>> {
+        // 1. Memory recall (same as process_message)
+        let memory_context = match self.embedder.embed(user_input).await {
+            Ok(query_emb) => {
+                let brain = self.brain.lock().unwrap();
+                let results = brain.recall_by_similarity(&query_emb, 5, 0.35);
+                if !results.is_empty() {
+                    let lines: Vec<String> = results
+                        .iter()
+                        .map(|(item, score)| {
+                            format!(
+                                "[{}] (sim: {:.2}) {}",
+                                item.memory_type, score,
+                                item.content.chars().take(200).collect::<String>()
+                            )
+                        })
+                        .collect();
+                    format!("\nRelevant memories:\n{}\n", lines.join("\n"))
+                } else {
+                    String::new()
+                }
+            }
+            Err(_) => {
+                let brain = self.brain.lock().unwrap();
+                let results = brain.recall(user_input, 5);
+                if !results.is_empty() {
+                    let lines: Vec<String> = results
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "[{}] (strength: {:.2}) {}",
+                                item.memory_type, item.strength,
+                                item.content.chars().take(200).collect::<String>()
+                            )
+                        })
+                        .collect();
+                    format!("\nRelevant memories:\n{}\n", lines.join("\n"))
+                } else {
+                    String::new()
+                }
+            }
+        };
+
+        // 2. Build augmented prompt
+        let augmented_input = if memory_context.is_empty() {
+            user_input.to_string()
+        } else {
+            format!("{}\n\n---\nContext from MemoryBrain:\n{}", user_input, memory_context)
+        };
+
+        self.messages.push(Message {
+            role: "user".to_string(),
+            content: augmented_input,
+        });
+
+        // 3. Stream the LLM response
+        let use_main = Self::needs_complex_model(user_input);
+        let llm = if use_main { &self.llm } else { &self.fast_llm };
+        let mut stream_rx = llm.chat_stream(self.messages.clone()).await?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+        let messages = self.messages.clone();
+        let brain = self.brain.clone();
+        let embedder = self.embedder.clone();
+        let user_input_owned = user_input.to_string();
+
+        // Collect the full response while forwarding chunks
+        let messages_ref = Arc::clone(&Arc::new(std::sync::Mutex::new(messages)));
+
+        tokio::spawn(async move {
+            let mut full_response = String::new();
+
+            while let Some(chunk) = stream_rx.recv().await {
+                full_response.push_str(&chunk);
+                if tx.send(chunk).await.is_err() {
+                    return; // receiver dropped
+                }
+            }
+
+            // Store conversation in messages
+            {
+                let mut msgs = messages_ref.lock().unwrap();
+                msgs.push(Message {
+                    role: "assistant".to_string(),
+                    content: full_response.clone(),
+                });
+            }
+
+            // Store in memory
+            let truncated: String = full_response.chars().take(300).collect();
+            let content = format!("User: {}\nAssistant: {}", user_input_owned, truncated);
+            if let Ok(emb) = embedder.embed(&content).await {
+                let mut item = crate::memory_brain::MemoryItem::new(
+                    &content,
+                    crate::memory_brain::MemoryType::Episodic,
+                );
+                item.embedding = Some(emb);
+                let brain = brain.lock().unwrap();
+                let _ = brain.episodic.store(item);
+            } else {
+                let mut brain = brain.lock().unwrap();
+                let _ = brain.process(&content, Some(crate::memory_brain::MemoryType::Episodic));
+            }
+        });
+
+        Ok(rx)
+    }
+
     /// Send a chat request using the appropriate model based on prompt complexity.
     /// Logs which model was selected.
     async fn chat_with_selected_model(&self, messages: Vec<Message>) -> Result<Message> {

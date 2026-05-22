@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::agent::Agent;
+use crate::llm::{Message, OllamaClient};
 use crate::memory_brain::Brain;
 use crate::tools::{ToolRegistry, skill_tools};
 
@@ -9,6 +9,7 @@ use crate::tools::{ToolRegistry, skill_tools};
 pub struct EvolutionEngine {
     pub brain: Arc<std::sync::Mutex<Brain>>,
     pub registry: Arc<std::sync::Mutex<ToolRegistry>>,
+    fast_llm: OllamaClient,
     reflection_interval: u64,
     episode_count: u64,
 }
@@ -17,11 +18,13 @@ impl EvolutionEngine {
     pub fn new(
         brain: Arc<std::sync::Mutex<Brain>>,
         registry: Arc<std::sync::Mutex<ToolRegistry>>,
+        fast_llm: OllamaClient,
         reflection_interval: u64,
     ) -> Self {
         Self {
             brain,
             registry,
+            fast_llm,
             reflection_interval,
             episode_count: 0,
         }
@@ -29,7 +32,7 @@ impl EvolutionEngine {
 
     /// Called after each user episode. At the configured interval, triggers
     /// a full evolution cycle: review → propose → extract → build → commit.
-    pub async fn after_episode(&mut self, agent: &mut Agent) -> Result<Option<String>> {
+    pub async fn after_episode(&mut self) -> Result<Option<String>> {
         self.episode_count += 1;
 
         if self.episode_count % self.reflection_interval == 0 {
@@ -38,7 +41,7 @@ impl EvolutionEngine {
                 self.episode_count
             );
 
-            let result = self.run_evolution_cycle(agent).await?;
+            let result = self.run_evolution_cycle().await?;
             Ok(Some(result))
         } else {
             Ok(None)
@@ -48,7 +51,7 @@ impl EvolutionEngine {
     // ─── Self-Evolution Cycle ──────────────────────────────────
 
     /// 1. Gemma proposes code → 2. Extract → 3. Save & Build → 4. Store & Commit
-    async fn run_evolution_cycle(&self, agent: &mut Agent) -> Result<String> {
+    async fn run_evolution_cycle(&self) -> Result<String> {
         let summary = self.brain.lock().unwrap().generate_context_summary();
         self.brain.lock().unwrap().record_reflection("evolution_cycle", "Starting self-evolution cycle")?;
 
@@ -69,13 +72,24 @@ Current state:
             summary
         );
 
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "You are a Rust code assistant. Generate concise, useful Rust code.".to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: code_prompt,
+            },
+        ];
+
         let response = match tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            agent.process_message_fast(&code_prompt),
+            self.fast_llm.chat(messages),
         )
         .await
         {
-            Ok(Ok(text)) => text,
+            Ok(Ok(msg)) => msg.content,
             Ok(Err(e)) => return Ok(format!("Evolution error: {}", e)),
             Err(_) => return Ok("Evolution timed out".to_string()),
         };
@@ -297,7 +311,8 @@ mod tests {
     fn test_engine() -> EvolutionEngine {
         let brain = Arc::new(Mutex::new(Brain::new("/tmp/gsea_test_memory").unwrap()));
         let registry = Arc::new(Mutex::new(crate::tools::ToolRegistry::new()));
-        EvolutionEngine::new(brain, registry, 5)
+        let fast_llm = crate::llm::OllamaClient::new("http://localhost:11434", "qwen3:8b");
+        EvolutionEngine::new(brain, registry, fast_llm, 5)
     }
 
     #[test]
