@@ -23,6 +23,15 @@ enum GuiEvent {
     StatsUpdate(String, usize), // (brain_stats_json, tool_count)
 }
 
+/// Dashboard data displayed in the sidebar.
+#[derive(Default, Clone)]
+struct DashboardData {
+    workflow_count: u32,
+    last_workflow: String,
+    agent_context_sizes: Vec<(String, usize)>,
+    total_messages_processed: u64,
+}
+
 pub struct GseaGui {
     agent: Arc<Mutex<Option<Agent>>>,
     brain: Arc<Mutex<Brain>>,
@@ -35,6 +44,8 @@ pub struct GseaGui {
     is_processing: bool,
     rx: mpsc::Receiver<GuiEvent>,
     tx: mpsc::Sender<GuiEvent>,
+    dashboard: DashboardData,
+    uptime: std::time::Instant,
 }
 
 impl GseaGui {
@@ -61,6 +72,8 @@ impl GseaGui {
             model_name: model_name.to_string(),
             is_processing: false,
             rx, tx,
+            dashboard: DashboardData::default(),
+            uptime: std::time::Instant::now(),
         }
     }
 
@@ -227,20 +240,51 @@ impl eframe::App for GseaGui {
             });
         });
 
+        // Update dashboard data periodically
+        {
+            if let Ok(ag) = self.agent.lock() {
+                if let Some(ref a) = *ag {
+                    self.dashboard.total_messages_processed = a.total_messages;
+                }
+            }
+        }
+
         // Sidebar
-        egui::SidePanel::right("sidebar").resizable(true).default_width(220.0).show(ctx, |ui| {
+        egui::SidePanel::right("sidebar").resizable(true).default_width(240.0).show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                // ── Dashboard ──
+                ui.label(egui::RichText::new("📊 Dashboard").size(14.0).strong());
+                ui.separator();
+                let elapsed = self.uptime.elapsed();
+                let mins = elapsed.as_secs() / 60;
+                let secs = elapsed.as_secs() % 60;
+                ui.label(egui::RichText::new(format!("Uptime: {}m {}s", mins, secs)).size(11.0).color(Color32::LIGHT_GRAY));
+                ui.label(egui::RichText::new(format!("Messages: {}", self.dashboard.total_messages_processed)).size(11.0).color(Color32::LIGHT_GRAY));
+                ui.label(egui::RichText::new(format!("Chat history: {}", self.messages.len())).size(11.0).color(Color32::LIGHT_GRAY));
+                if self.is_processing {
+                    ui.label(egui::RichText::new("Status: Processing…").size(11.0).color(Color32::from_rgb(255, 200, 50)));
+                } else {
+                    ui.label(egui::RichText::new("Status: Ready").size(11.0).color(Color32::from_rgb(80, 220, 150)));
+                }
+                ui.add_space(12.0);
+
+                // ── Brain ──
                 ui.label(egui::RichText::new("🧠 Brain").size(14.0).strong());
                 ui.separator();
                 ui.monospace(egui::RichText::new(&self.brain_stats).size(11.0).color(Color32::LIGHT_GRAY));
                 ui.add_space(12.0);
+
+                // ── Tools ──
                 ui.label(egui::RichText::new("🔧 Tools").size(14.0).strong());
                 ui.separator();
                 let tools = self.registry.lock().unwrap();
                 for t in tools.list_tools() {
                     ui.label(egui::RichText::new(format!("• {}", t.name())).size(12.0).color(Color32::from_rgb(180, 190, 200)));
                 }
+                drop(tools);
                 ui.add_space(12.0);
+
+                // ── Skills ──
                 ui.label(egui::RichText::new("💡 Skills").size(14.0).strong());
                 ui.separator();
                 let b = self.brain.lock().unwrap();
@@ -250,6 +294,22 @@ impl eframe::App for GseaGui {
                 } else {
                     for (name, desc) in &skills {
                         ui.label(egui::RichText::new(format!("• {}: {}", name, desc)).size(11.0).color(Color32::from_rgb(160, 200, 160)));
+                    }
+                }
+                drop(b);
+                ui.add_space(12.0);
+
+                // ── Recent Memories ──
+                ui.label(egui::RichText::new("🔖 Recent Memories").size(14.0).strong());
+                ui.separator();
+                let b = self.brain.lock().unwrap();
+                let recent = b.recall("", 5);
+                if recent.is_empty() {
+                    ui.label(egui::RichText::new("(empty)").color(Color32::GRAY).size(11.0));
+                } else {
+                    for item in &recent {
+                        let preview: String = item.content.chars().take(60).collect();
+                        ui.label(egui::RichText::new(format!("[{}] {}", item.memory_type, preview)).size(10.0).color(Color32::from_rgb(160, 170, 190)));
                     }
                 }
             });

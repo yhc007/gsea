@@ -634,6 +634,9 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
     }
     println!("{}", "─".repeat(50));
 
+    // Agent performance tracking
+    let agent_stats = new_agent_stats_map();
+
     // REPL loop.
     let mut rl = rustyline::DefaultEditor::new()?;
     loop {
@@ -658,6 +661,30 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                                 _ => "unknown",
                             };
                             println!("  {} [{}]", id, role);
+                        }
+                        continue;
+                    }
+                    "/stats agents" => {
+                        let stats = agent_stats.lock().unwrap();
+                        println!("Agent Performance Stats:");
+                        println!("{:<16} {:>6} {:>6} {:>7} {:>8} {:>6}",
+                            "Agent", "Done", "Fail", "Rate%", "Avg Out", "ReAct");
+                        println!("{}", "─".repeat(58));
+                        for (id, s) in stats.iter() {
+                            println!("{:<16} {:>6} {:>6} {:>6.1}% {:>8} {:>6}",
+                                id, s.tasks_completed, s.tasks_failed,
+                                s.success_rate(), s.avg_output_chars(),
+                                s.react_iterations);
+                        }
+                        // Also show context sizes
+                        println!("\nContext Sizes:");
+                        for (id, arc) in &agent_arcs {
+                            if let Ok(guard) = arc.try_lock() {
+                                if let Some(agent) = guard.as_ref() {
+                                    println!("  {}: {} messages ({} total processed)",
+                                        id, agent.context_len(), agent.total_messages);
+                                }
+                            }
                         }
                         continue;
                     }
@@ -719,6 +746,7 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                                             target, task_desc, &text[..text.len().min(2000)], None,
                                         );
                                     }
+                                    record_agent_success(&agent_stats, target, text.len());
                                 }
                                 Ok(Err(e)) => {
                                     eprintln!("[{}] Error: {}", target, e);
@@ -726,6 +754,7 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                                         task_id,
                                         error: e.clone(),
                                     }).await?;
+                                    record_agent_failure(&agent_stats, target);
                                 }
                                 Err(e) => {
                                     eprintln!("[{}] Communication error: {}", target, e);
@@ -1088,6 +1117,71 @@ fn make_query(input: &str) -> UserQuery {
 
 /// Type alias for shared agent arcs used by streaming workflows.
 type SharedAgent = Arc<tokio::sync::Mutex<Option<Agent>>>;
+
+// ─── Agent Performance Stats ──────────────────────────────────────────
+
+/// Tracks per-agent performance statistics across workflows.
+#[derive(Default, Clone)]
+struct AgentStats {
+    tasks_completed: u64,
+    tasks_failed: u64,
+    total_output_chars: u64,
+    react_iterations: u64,
+    react_successes: u64,
+}
+
+impl AgentStats {
+    fn record_success(&mut self, output_len: usize) {
+        self.tasks_completed += 1;
+        self.total_output_chars += output_len as u64;
+    }
+
+    fn record_failure(&mut self) {
+        self.tasks_failed += 1;
+    }
+
+    fn record_react(&mut self, iterations: u64, success: bool) {
+        self.react_iterations += iterations;
+        if success {
+            self.react_successes += 1;
+        }
+    }
+
+    fn success_rate(&self) -> f64 {
+        let total = self.tasks_completed + self.tasks_failed;
+        if total == 0 { return 0.0; }
+        self.tasks_completed as f64 / total as f64 * 100.0
+    }
+
+    fn avg_output_chars(&self) -> u64 {
+        if self.tasks_completed == 0 { return 0; }
+        self.total_output_chars / self.tasks_completed
+    }
+}
+
+/// Shared stats map for all agents.
+type AgentStatsMap = Arc<std::sync::Mutex<std::collections::HashMap<String, AgentStats>>>;
+
+fn new_agent_stats_map() -> AgentStatsMap {
+    let mut map = std::collections::HashMap::new();
+    map.insert("gsea-main".to_string(), AgentStats::default());
+    map.insert("gsea-coder".to_string(), AgentStats::default());
+    map.insert("gsea-reviewer".to_string(), AgentStats::default());
+    map.insert("gsea-tester".to_string(), AgentStats::default());
+    Arc::new(std::sync::Mutex::new(map))
+}
+
+fn record_agent_success(stats: &AgentStatsMap, agent_id: &str, output_len: usize) {
+    if let Ok(mut map) = stats.lock() {
+        map.entry(agent_id.to_string()).or_default().record_success(output_len);
+    }
+}
+
+fn record_agent_failure(stats: &AgentStatsMap, agent_id: &str) {
+    if let Ok(mut map) = stats.lock() {
+        map.entry(agent_id.to_string()).or_default().record_failure();
+    }
+}
 
 /// Run a streaming workflow step: temporarily borrow the agent from its shared
 /// Arc, call `process_message_stream`, print chunks in real-time, and return
