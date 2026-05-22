@@ -493,6 +493,8 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
     println!("  /workflow <task>             — run coder→reviewer→tester pipeline");
     println!("  /workflow list               — list workflow templates");
     println!("  /workflow run <name> <task>  — run a named template");
+    println!("  /workflow parallel <task>    — run coder+reviewer in parallel, then tester");
+    println!("  /evolve [target]             — self-evolution: analyze→improve→verify");
     println!("  /history [query]             — recall past agent results");
     println!("  /memory <text>               — store a CLS memory");
     println!("  /dream                       — run dream consolidation");
@@ -730,6 +732,11 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                         }
                         continue;
                     }
+                    cmd if cmd.starts_with("/evolve") => {
+                        let target = cmd.trim_start_matches("/evolve").trim();
+                        run_evolve(target, &agent_arcs, &orch_ref, &brain_ref, evolution).await?;
+                        continue;
+                    }
                     cmd if cmd.starts_with("/workflow") => {
                         let rest = cmd.trim_start_matches("/workflow").trim();
                         if rest.is_empty() {
@@ -806,6 +813,12 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                                 Ok(_) => println!("Template '{}' saved.", name),
                                 Err(e) => eprintln!("Failed to save template: {}", e),
                             }
+                            continue;
+                        }
+
+                        if rest.starts_with("parallel ") {
+                            let task = rest.trim_start_matches("parallel ").trim();
+                            run_parallel_workflow(task, &agent_arcs, &orch_ref, &brain_ref).await?;
                             continue;
                         }
 
@@ -1535,6 +1548,425 @@ async fn run_template_workflow(
         }
     }
     println!("Workflow ID: {}", workflow_id);
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    Ok(())
+}
+
+// ─── Self-Evolution (/evolve) ─────────────────────────────────────────
+
+/// Self-evolution pipeline: the agent analyzes its own code, proposes
+/// improvements, implements them via the coder agent with ReAct loop
+/// verification, and gets a review before committing.
+///
+/// Flow: analyze → propose → coder(ReAct) → reviewer → commit
+///
+/// If `target` is empty, the agent picks what to improve. If given,
+/// it focuses on the specified file or module.
+async fn run_evolve(
+    target: &str,
+    agent_arcs: &std::collections::HashMap<String, SharedAgent>,
+    orch_ref: &ActorRef<OrchestratorMessage>,
+    brain_ref: &Arc<std::sync::Mutex<Brain>>,
+    evolution: &mut EvolutionEngine,
+) -> Result<()> {
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Self-Evolution Pipeline");
+    if target.is_empty() {
+        println!("Target: (auto-detect)");
+    } else {
+        println!("Target: {}", target);
+    }
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    let coder_arc = agent_arcs.get("gsea-coder");
+    let reviewer_arc = agent_arcs.get("gsea-reviewer");
+    if coder_arc.is_none() || reviewer_arc.is_none() {
+        eprintln!("Missing coder or reviewer agent");
+        return Ok(());
+    }
+    let coder_arc = coder_arc.unwrap();
+    let reviewer_arc = reviewer_arc.unwrap();
+
+    // ── Phase 1: Analyze ──────────────────────────────────────────
+    println!("\n── Phase 1/4: Analyze ──────────────────────────────────");
+
+    // Gather context: memory stats, recent skills, project structure
+    let context = {
+        let brain = brain_ref.lock().unwrap();
+        let stats = brain.stats();
+        let skills = brain.list_skills();
+        let skill_list: String = skills.iter()
+            .take(10)
+            .map(|(n, d)| format!("  - {}: {}", n, d))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Memory: {}\nLearned skills ({}):\n{}",
+            stats, skills.len(), skill_list
+        )
+    };
+
+    // Read target source or list src/ files for auto-detection
+    let source_context = if !target.is_empty() {
+        match tokio::fs::read_to_string(target).await {
+            Ok(content) => {
+                let truncated: String = content.chars().take(4000).collect();
+                format!("Target file: {}\n```rust\n{}\n```", target, truncated)
+            }
+            Err(_) => format!("Target: {} (could not read file, treating as module name)", target),
+        }
+    } else {
+        // List src/ files for auto-detection
+        let output = tokio::process::Command::new("find")
+            .args(["src", "-name", "*.rs", "-type", "f"])
+            .output()
+            .await;
+        match output {
+            Ok(o) => {
+                let files = String::from_utf8_lossy(&o.stdout);
+                format!("Source files:\n{}", files)
+            }
+            Err(_) => "Source files: (could not list)".to_string(),
+        }
+    };
+
+    let analyze_prompt = format!(
+        "You are GSEA's self-evolution system. Analyze the codebase and suggest ONE concrete improvement.\n\n\
+         {}\n\n\
+         {}\n\n\
+         Pick ONE improvement that:\n\
+         1. Adds a useful utility function, improves error handling, or refactors for clarity\n\
+         2. Is small (under 50 lines of changes)\n\
+         3. Will compile and pass tests\n\n\
+         Respond with:\n\
+         - **Target file**: exact path\n\
+         - **Change type**: new function / refactor / fix\n\
+         - **Description**: what and why (1-2 sentences)\n\
+         - **Specific changes**: describe exactly what to add/modify",
+        context, source_context
+    );
+
+    let analysis = run_streaming_step(reviewer_arc, &analyze_prompt).await?;
+
+    // ── Phase 2: Implement ────────────────────────────────────────
+    println!("\n── Phase 2/4: Implement (ReAct) ──────────────────────────────────");
+
+    let implement_prompt = format!(
+        "Implement the following improvement to the GSEA codebase.\n\n\
+         --- Analysis ---\n{}\n--- End ---\n\n\
+         Rules:\n\
+         - Write complete, compilable Rust code\n\
+         - Use the write_file tool to save your changes\n\
+         - Include unit tests if adding new functions\n\
+         - Keep changes minimal and focused\n\
+         - Use anyhow::Result for error handling\n\n\
+         Implement the change now.",
+        analysis
+    );
+
+    let task_id = uuid::Uuid::new_v4();
+    orch_ref.tell(OrchestratorMessage::SubmitTask(AgentTask {
+        task_id,
+        description: format!("Evolve: {}", if target.is_empty() { "auto" } else { target }),
+        input: serde_json::json!({ "type": "evolution" }),
+        priority: TaskPriority::Normal,
+        timeout_ms: 180_000,
+    })).await?;
+
+    let implementation = match run_react_step(
+        coder_arc, &implement_prompt, "cargo build 2>&1", 3,
+    ).await {
+        Ok(text) => {
+            orch_ref.tell(OrchestratorMessage::CompleteTask {
+                task_id,
+                result: serde_json::json!({ "status": "ok" }),
+            }).await?;
+            text
+        }
+        Err(e) => {
+            eprintln!("Implementation failed: {}", e);
+            orch_ref.tell(OrchestratorMessage::FailTask {
+                task_id, error: e.to_string(),
+            }).await?;
+            println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("Evolution FAILED at implementation phase");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            return Ok(());
+        }
+    };
+
+    // ── Phase 3: Review ───────────────────────────────────────────
+    println!("\n── Phase 3/4: Review ──────────────────────────────────");
+
+    let review_prompt = format!(
+        "Review this self-evolution change for correctness and safety.\n\n\
+         --- Original analysis ---\n{}\n\n\
+         --- Implementation ---\n{}\n--- End ---\n\n\
+         Check:\n\
+         1. Does the implementation match the analysis?\n\
+         2. Any bugs, panics, or unsafe patterns?\n\
+         3. Will this break existing functionality?\n\n\
+         Say APPROVED if safe, or list specific issues.",
+        analysis, implementation
+    );
+
+    let review = run_streaming_step(reviewer_arc, &review_prompt).await?;
+
+    // ── Phase 4: Commit (if approved) ─────────────────────────────
+    println!("\n── Phase 4/4: Commit ──────────────────────────────────");
+
+    if review_has_critical_issues(&review) {
+        println!("  ⚠ Review found critical issues — skipping commit");
+        println!("  Run /evolve again to retry with a different improvement");
+        if let Ok(mut brain) = brain_ref.lock() {
+            let _ = brain.store_agent_result(
+                "evolution", "self-evolution (rejected)",
+                &format!("Analysis:\n{}\n\nReview:\n{}", &analysis[..analysis.len().min(500)], &review[..review.len().min(500)]),
+                None,
+            );
+        }
+    } else {
+        println!("  ✓ Review passed — committing");
+
+        // Run tests before committing
+        println!("  ⚙ Running cargo test…");
+        let test_output = tokio::process::Command::new("cargo")
+            .args(["test", "--", "--quiet"])
+            .output()
+            .await;
+
+        let tests_pass = matches!(&test_output, Ok(o) if o.status.success());
+        if tests_pass {
+            println!("  ✓ Tests passed");
+
+            // Git commit
+            evolution.git_commit("self-evolution").await;
+            println!("  ✓ Committed");
+
+            // Store in Brain
+            if let Ok(mut brain) = brain_ref.lock() {
+                let _ = brain.store_agent_result(
+                    "evolution", "self-evolution (committed)",
+                    &format!("Analysis:\n{}\n\nImplementation:\n{}", &analysis[..analysis.len().min(1000)], &implementation[..implementation.len().min(1000)]),
+                    None,
+                );
+                let _ = brain.record_reflection("evolution_success", &analysis[..analysis.len().min(200)]);
+            }
+        } else {
+            println!("  ✗ Tests failed — skipping commit");
+            if let Ok(o) = &test_output {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let preview: String = stderr.chars().take(500).collect();
+                if !preview.is_empty() {
+                    println!("  {}", preview);
+                }
+            }
+        }
+    }
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Self-Evolution pipeline complete");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    Ok(())
+}
+
+// ─── Parallel Workflow ────────────────────────────────────────────────
+
+/// Execute a parallel workflow: coder and reviewer run simultaneously
+/// on the same task, then tester runs with both outputs.
+///
+/// This leverages tokio::spawn to run independent steps concurrently,
+/// reducing total wall-clock time compared to the sequential pipeline.
+///
+/// Flow:
+///   ┌── coder ──┐
+///   │           ├──→ tester
+///   └── reviewer┘
+async fn run_parallel_workflow(
+    task_desc: &str,
+    agent_arcs: &std::collections::HashMap<String, SharedAgent>,
+    orch_ref: &ActorRef<OrchestratorMessage>,
+    brain_ref: &Arc<std::sync::Mutex<Brain>>,
+) -> Result<()> {
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Parallel Workflow: (coder ∥ reviewer) → tester");
+    println!("Task: {}", task_desc);
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    let coder_arc = agent_arcs.get("gsea-coder");
+    let reviewer_arc = agent_arcs.get("gsea-reviewer");
+    let tester_arc = agent_arcs.get("gsea-tester");
+
+    if coder_arc.is_none() || reviewer_arc.is_none() || tester_arc.is_none() {
+        eprintln!("Missing required agents");
+        return Ok(());
+    }
+    let coder_arc = coder_arc.unwrap().clone();
+    let reviewer_arc = reviewer_arc.unwrap().clone();
+    let tester_arc = tester_arc.unwrap();
+
+    let workflow_id = uuid::Uuid::new_v4();
+
+    // ── Phase 1: Coder + Reviewer in parallel ─────────────────────
+    println!("\n── Phase 1/2: Coder ∥ Reviewer (parallel) ──────────────────────");
+
+    let coder_prompt = format!(
+        "Task: {}\n\n\
+         Write the implementation for this task. \
+         Produce complete, compilable Rust code. \
+         Explain your approach briefly, then show the code.",
+        task_desc
+    );
+
+    let reviewer_prompt = format!(
+        "Task: {}\n\n\
+         Analyze this task from a reviewer's perspective BEFORE seeing any code.\n\
+         Identify:\n\
+         1. Potential pitfalls and edge cases\n\
+         2. Rust safety considerations\n\
+         3. Suggested approach and patterns\n\
+         4. What tests should cover\n\n\
+         This pre-review will be combined with the coder's output.",
+        task_desc
+    );
+
+    // Submit tasks to orchestrator
+    let coder_task_id = uuid::Uuid::new_v4();
+    let reviewer_task_id = uuid::Uuid::new_v4();
+    orch_ref.tell(OrchestratorMessage::SubmitTask(AgentTask {
+        task_id: coder_task_id,
+        description: format!("Parallel coder: {}", &task_desc[..task_desc.len().min(60)]),
+        input: serde_json::json!({ "type": "parallel_code" }),
+        priority: TaskPriority::Normal,
+        timeout_ms: 120_000,
+    })).await?;
+    orch_ref.tell(OrchestratorMessage::SubmitTask(AgentTask {
+        task_id: reviewer_task_id,
+        description: format!("Parallel reviewer: {}", &task_desc[..task_desc.len().min(60)]),
+        input: serde_json::json!({ "type": "parallel_review" }),
+        priority: TaskPriority::Normal,
+        timeout_ms: 120_000,
+    })).await?;
+
+    // Run both tasks concurrently using tokio::join!
+    // (Not tokio::spawn — agent futures hold std::sync::MutexGuard across await points)
+    println!("  [coder + reviewer] Starting in parallel…");
+    let (coder_result, reviewer_result) = tokio::join!(
+        run_streaming_step(&coder_arc, &coder_prompt),
+        run_streaming_step(&reviewer_arc, &reviewer_prompt),
+    );
+    println!("  [coder + reviewer] Both done");
+
+    let coder_output = match coder_result {
+        Ok(text) => {
+            orch_ref.tell(OrchestratorMessage::CompleteTask {
+                task_id: coder_task_id,
+                result: serde_json::json!({ "status": "ok" }),
+            }).await?;
+            if let Ok(mut brain) = brain_ref.lock() {
+                let _ = brain.store_agent_result(
+                    "gsea-coder", &format!("[Parallel/coder] {}", task_desc),
+                    &text[..text.len().min(2000)], Some(&workflow_id.to_string()),
+                );
+            }
+            text
+        }
+        Err(e) => {
+            eprintln!("[coder] Error: {}", e);
+            orch_ref.tell(OrchestratorMessage::FailTask {
+                task_id: coder_task_id, error: e.to_string(),
+            }).await?;
+            println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("Parallel workflow FAILED at coder");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            return Ok(());
+        }
+    };
+
+    let reviewer_output = match reviewer_result {
+        Ok(text) => {
+            orch_ref.tell(OrchestratorMessage::CompleteTask {
+                task_id: reviewer_task_id,
+                result: serde_json::json!({ "status": "ok" }),
+            }).await?;
+            if let Ok(mut brain) = brain_ref.lock() {
+                let _ = brain.store_agent_result(
+                    "gsea-reviewer", &format!("[Parallel/reviewer] {}", task_desc),
+                    &text[..text.len().min(2000)], Some(&workflow_id.to_string()),
+                );
+            }
+            text
+        }
+        Err(e) => {
+            eprintln!("[reviewer] Error: {}", e);
+            orch_ref.tell(OrchestratorMessage::FailTask {
+                task_id: reviewer_task_id, error: e.to_string(),
+            }).await?;
+            format!("(reviewer failed: {})", e)
+        }
+    };
+
+    // ── Phase 2: Tester with combined context ─────────────────────
+    println!("\n── Phase 2/2: Tester ──────────────────────────────────");
+
+    let test_prompt = format!(
+        "Original task: {}\n\n\
+         --- Coder's implementation ---\n{}\n\
+         --- End coder ---\n\n\
+         --- Reviewer's pre-analysis ---\n{}\n\
+         --- End reviewer ---\n\n\
+         Write comprehensive tests combining the coder's implementation\n\
+         with the reviewer's insights. Cover:\n\
+         - Happy path\n\
+         - Edge cases identified by the reviewer\n\
+         - Error paths\n\
+         Show the test code.",
+        task_desc, coder_output, reviewer_output
+    );
+
+    let test_task_id = uuid::Uuid::new_v4();
+    orch_ref.tell(OrchestratorMessage::SubmitTask(AgentTask {
+        task_id: test_task_id,
+        description: format!("Parallel tester: {}", &task_desc[..task_desc.len().min(60)]),
+        input: serde_json::json!({ "type": "parallel_test" }),
+        priority: TaskPriority::Normal,
+        timeout_ms: 120_000,
+    })).await?;
+
+    let tester_output = match run_react_step(
+        tester_arc, &test_prompt, "cargo test 2>&1", 3,
+    ).await {
+        Ok(text) => {
+            orch_ref.tell(OrchestratorMessage::CompleteTask {
+                task_id: test_task_id,
+                result: serde_json::json!({ "status": "ok" }),
+            }).await?;
+            if let Ok(mut brain) = brain_ref.lock() {
+                let _ = brain.store_agent_result(
+                    "gsea-tester", &format!("[Parallel/tester] {}", task_desc),
+                    &text[..text.len().min(2000)], Some(&workflow_id.to_string()),
+                );
+            }
+            text
+        }
+        Err(e) => {
+            eprintln!("[tester] Error: {}", e);
+            orch_ref.tell(OrchestratorMessage::FailTask {
+                task_id: test_task_id, error: e.to_string(),
+            }).await?;
+            String::from("(tester failed)")
+        }
+    };
+
+    // Summary
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Parallel Workflow COMPLETED");
+    println!("Workflow ID: {}", workflow_id);
+    println!("  coder:    {} chars (parallel)", coder_output.len());
+    println!("  reviewer: {} chars (parallel)", reviewer_output.len());
+    println!("  tester:   {} chars (sequential)", tester_output.len());
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     Ok(())

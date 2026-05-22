@@ -282,7 +282,7 @@ Current state:
         matches!(output, Ok(o) if o.status.success())
     }
 
-    async fn git_commit(&self, skill_name: &str) {
+    pub async fn git_commit(&self, skill_name: &str) {
         let project_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()))
