@@ -1017,14 +1017,125 @@ async fn run_streaming_step(
     result
 }
 
-/// Execute a coder → reviewer → tester workflow pipeline with streaming output.
+/// Run a ReAct (Reason-Act-Observe) loop: send prompt → get response →
+/// verify with `cargo build`/`cargo test` → if failure, feed error back
+/// to the agent and repeat.
 ///
-/// 1. **Coder** receives the task and produces code/implementation
-/// 2. **Reviewer** receives the coder's output and reviews it
-/// 3. **Tester** receives both outputs and writes/runs tests
+/// Returns the final successful response or the last response after
+/// exhausting `max_iterations`.
+async fn run_react_step(
+    agent_arc: &SharedAgent,
+    initial_prompt: &str,
+    verify_cmd: &str,
+    max_iterations: usize,
+) -> Result<String> {
+    let mut prompt = initial_prompt.to_string();
+    let mut last_response = String::new();
+
+    for iteration in 1..=max_iterations {
+        if iteration > 1 {
+            println!("\n  ↻ ReAct iteration {}/{}", iteration, max_iterations);
+        }
+
+        // Get agent response (streaming)
+        last_response = run_streaming_step(agent_arc, &prompt).await?;
+
+        // Skip verification if no verify command
+        if verify_cmd.is_empty() {
+            return Ok(last_response);
+        }
+
+        // Run verification command
+        println!("\n  ⚙ Verifying: {}…", verify_cmd);
+        let verify_output = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(verify_cmd)
+            .output()
+            .await;
+
+        match verify_output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if output.status.success() {
+                    println!("  ✓ Verification passed");
+                    return Ok(last_response);
+                }
+
+                // Verification failed — build the retry prompt
+                let error_output = if !stderr.is_empty() {
+                    stderr.to_string()
+                } else {
+                    stdout.to_string()
+                };
+
+                // Truncate error output for the prompt
+                let error_truncated: String = error_output.chars().take(3000).collect();
+
+                println!("  ✗ Verification failed (iteration {}/{})", iteration, max_iterations);
+                if iteration < max_iterations {
+                    prompt = format!(
+                        "The previous code has errors. Fix them.\n\n\
+                         --- Verification command: {} ---\n\
+                         --- Error output ---\n{}\n\
+                         --- End ---\n\n\
+                         Fix the issues and provide the corrected code. \
+                         Show only the changed parts.",
+                        verify_cmd, error_truncated
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("  ⚠ Could not run verification: {}", e);
+                return Ok(last_response);
+            }
+        }
+    }
+
+    println!("  ⚠ Max iterations ({}) reached, returning last response", max_iterations);
+    Ok(last_response)
+}
+
+/// Analyze a reviewer's response to determine severity.
 ///
-/// Each step streams tokens in real-time as they arrive from the LLM.
-/// Each step's full output is passed as context to the next step.
+/// Returns `true` if the review indicates critical issues that require
+/// the coder to fix before proceeding.
+///
+/// Heuristic: looks for keywords indicating blocking problems.
+fn review_has_critical_issues(review_text: &str) -> bool {
+    let lower = review_text.to_lowercase();
+    let critical_keywords = [
+        "critical", "severe", "blocking", "must fix", "incorrect",
+        "bug", "panic", "undefined behavior", "unsafe", "security",
+        "memory leak", "data race", "deadlock", "crash",
+        "will not compile", "does not compile", "compilation error",
+        "fails to build", "broken",
+    ];
+    let positive_keywords = [
+        "no issues", "looks good", "lgtm", "approved",
+        "no critical", "no major", "well-written", "clean",
+        "no bugs", "correct",
+    ];
+
+    // If positive signals dominate, no critical issues
+    let positive_count = positive_keywords.iter().filter(|k| lower.contains(*k)).count();
+    if positive_count >= 2 {
+        return false;
+    }
+
+    // Check for critical signals
+    let critical_count = critical_keywords.iter().filter(|k| lower.contains(*k)).count();
+    critical_count >= 2
+}
+
+/// Execute a coder → reviewer → tester workflow pipeline with:
+/// - **Streaming output** for real-time token display
+/// - **ReAct loop** on the coder step: auto-verify with `cargo build` and
+///   feed errors back for up to 3 self-correction iterations
+/// - **Conditional branching**: if the reviewer finds critical issues, the
+///   coder is asked to fix them and the reviewer re-reviews (up to 2 rounds)
+///
 /// The workflow is tracked via the OrchestratorActor.
 async fn run_workflow(
     task_desc: &str,
@@ -1032,9 +1143,14 @@ async fn run_workflow(
     orch_ref: &ActorRef<OrchestratorMessage>,
     brain_ref: &Arc<std::sync::Mutex<Brain>>,
 ) -> Result<()> {
+    const MAX_REACT_ITERATIONS: usize = 3;
+    const MAX_REVIEW_ROUNDS: usize = 2;
+
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("Workflow: coder → reviewer → tester (streaming)");
+    println!("Workflow: coder → reviewer → tester (streaming + ReAct)");
     println!("Task: {}", task_desc);
+    println!("  ReAct: up to {} coder iterations with cargo build", MAX_REACT_ITERATIONS);
+    println!("  Review: up to {} coder↔reviewer rounds", MAX_REVIEW_ROUNDS);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // Build workflow definition for orchestrator tracking
@@ -1073,116 +1189,226 @@ async fn run_workflow(
     let workflow_id = workflow.id;
     orch_ref.tell(OrchestratorMessage::CreateWorkflow(workflow)).await?;
 
-    // Pipeline steps: (agent_id, step_label)
-    let steps: Vec<(&str, &str)> = vec![
-        ("gsea-coder", "Step 1/3: Coder"),
-        ("gsea-reviewer", "Step 2/3: Reviewer"),
-        ("gsea-tester", "Step 3/3: Tester"),
-    ];
+    let coder_arc = agent_arcs.get("gsea-coder");
+    let reviewer_arc = agent_arcs.get("gsea-reviewer");
+    let tester_arc = agent_arcs.get("gsea-tester");
 
-    let mut step_outputs: Vec<String> = Vec::new();
-    let mut failed = false;
+    if coder_arc.is_none() || reviewer_arc.is_none() || tester_arc.is_none() {
+        eprintln!("Missing required agents, aborting workflow");
+        return Ok(());
+    }
+    let coder_arc = coder_arc.unwrap();
+    let reviewer_arc = reviewer_arc.unwrap();
+    let tester_arc = tester_arc.unwrap();
 
-    for (i, (agent_id, label)) in steps.iter().enumerate() {
-        println!("\n── {} ──────────────────────────────────", label);
+    // ── Step 1: Coder with ReAct loop ──────────────────────────────
+    println!("\n── Step 1/3: Coder (ReAct) ──────────────────────────────────");
 
-        let agent_arc = match agent_arcs.get(*agent_id) {
-            Some(a) => a,
-            None => {
-                eprintln!("Agent {} not found, aborting workflow", agent_id);
-                failed = true;
-                break;
+    let coder_prompt = format!(
+        "Task: {}\n\n\
+         Write the implementation for this task. \
+         Produce complete, compilable Rust code. \
+         Explain your approach briefly, then show the code.",
+        task_desc
+    );
+
+    let task_id = uuid::Uuid::new_v4();
+    orch_ref.tell(OrchestratorMessage::SubmitTask(AgentTask {
+        task_id,
+        description: format!("Coder (ReAct): {}", &task_desc[..task_desc.len().min(60)]),
+        input: serde_json::json!({ "prompt": &coder_prompt[..coder_prompt.len().min(200)] }),
+        priority: TaskPriority::Normal,
+        timeout_ms: 120_000,
+    })).await?;
+
+    let coder_output = match run_react_step(
+        coder_arc, &coder_prompt, "cargo build 2>&1", MAX_REACT_ITERATIONS,
+    ).await {
+        Ok(text) => {
+            orch_ref.tell(OrchestratorMessage::CompleteTask {
+                task_id,
+                result: serde_json::json!({ "status": "ok" }),
+            }).await?;
+            if let Ok(mut brain) = brain_ref.lock() {
+                let _ = brain.store_agent_result(
+                    "gsea-coder", &format!("[Coder/ReAct] {}", task_desc),
+                    &text[..text.len().min(2000)], Some(&workflow_id.to_string()),
+                );
             }
-        };
+            text
+        }
+        Err(e) => {
+            eprintln!("[gsea-coder] Error: {}", e);
+            orch_ref.tell(OrchestratorMessage::FailTask {
+                task_id, error: e.to_string(),
+            }).await?;
+            println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("Workflow FAILED at coder step");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            return Ok(());
+        }
+    };
 
-        // Build the prompt with context from previous steps
-        let prompt = match i {
-            0 => format!(
-                "Task: {}\n\n\
-                 Write the implementation for this task. \
-                 Produce complete, compilable Rust code. \
-                 Explain your approach briefly, then show the code.",
-                task_desc
-            ),
-            1 => format!(
-                "Original task: {}\n\n\
-                 --- Coder's output ---\n{}\n\
-                 --- End of coder's output ---\n\n\
-                 Review the code above for:\n\
-                 1. Correctness and potential bugs\n\
-                 2. Safety issues (unwrap, unsafe, panics)\n\
-                 3. Performance concerns\n\
-                 4. Idiomatic Rust style\n\
-                 Be specific and actionable.",
-                task_desc, step_outputs[0]
-            ),
-            2 => format!(
-                "Original task: {}\n\n\
-                 --- Coder's output ---\n{}\n\
-                 --- Reviewer's feedback ---\n{}\n\
-                 --- End ---\n\n\
-                 Write comprehensive tests for the implementation above.\n\
-                 Cover: happy path, edge cases, error paths.\n\
-                 Show the test code and describe what each test verifies.",
-                task_desc, step_outputs[0], step_outputs[1]
-            ),
-            _ => unreachable!(),
-        };
+    // ── Step 2: Reviewer with conditional branching ──────────────────
+    let mut current_code = coder_output.clone();
+    let mut review_output = String::new();
 
-        // Submit task to orchestrator
+    for review_round in 1..=MAX_REVIEW_ROUNDS {
+        let round_label = if review_round == 1 {
+            "Step 2/3: Reviewer".to_string()
+        } else {
+            format!("Step 2/3: Reviewer (round {})", review_round)
+        };
+        println!("\n── {} ──────────────────────────────────", round_label);
+
+        let review_prompt = format!(
+            "Original task: {}\n\n\
+             --- Coder's output ---\n{}\n\
+             --- End of coder's output ---\n\n\
+             Review the code above for:\n\
+             1. Correctness and potential bugs\n\
+             2. Safety issues (unwrap, unsafe, panics)\n\
+             3. Performance concerns\n\
+             4. Idiomatic Rust style\n\n\
+             Start your review with a severity assessment:\n\
+             - If there are critical/blocking issues, say \"CRITICAL\" and list them.\n\
+             - If the code looks good, say \"APPROVED\" or \"no critical issues\".\n\
+             Be specific and actionable.",
+            task_desc, current_code
+        );
+
         let task_id = uuid::Uuid::new_v4();
         orch_ref.tell(OrchestratorMessage::SubmitTask(AgentTask {
             task_id,
-            description: format!("{}: {}", label, &task_desc[..task_desc.len().min(60)]),
-            input: serde_json::json!({ "prompt": &prompt[..prompt.len().min(200)] }),
+            description: format!("{}: {}", round_label, &task_desc[..task_desc.len().min(60)]),
+            input: serde_json::json!({ "prompt": &review_prompt[..review_prompt.len().min(200)] }),
             priority: TaskPriority::Normal,
             timeout_ms: 120_000,
         })).await?;
 
-        // Stream the response from the agent
-        match run_streaming_step(agent_arc, &prompt).await {
+        match run_streaming_step(reviewer_arc, &review_prompt).await {
             Ok(text) => {
                 orch_ref.tell(OrchestratorMessage::CompleteTask {
-                    task_id,
-                    result: serde_json::json!({ "status": "ok" }),
+                    task_id, result: serde_json::json!({ "status": "ok" }),
                 }).await?;
-
-                // Store step result in Brain for cross-session memory sharing
                 if let Ok(mut brain) = brain_ref.lock() {
                     let _ = brain.store_agent_result(
-                        agent_id,
-                        &format!("[{}] {}", label, task_desc),
-                        &text[..text.len().min(2000)],
-                        Some(&workflow_id.to_string()),
+                        "gsea-reviewer", &format!("[Reviewer/round {}] {}", review_round, task_desc),
+                        &text[..text.len().min(2000)], Some(&workflow_id.to_string()),
                     );
                 }
-
-                step_outputs.push(text);
+                review_output = text;
             }
             Err(e) => {
-                eprintln!("[{}] Error: {}", agent_id, e);
+                eprintln!("[gsea-reviewer] Error: {}", e);
                 orch_ref.tell(OrchestratorMessage::FailTask {
-                    task_id,
-                    error: e.to_string(),
+                    task_id, error: e.to_string(),
                 }).await?;
-                failed = true;
-                break;
+                println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("Workflow FAILED at reviewer step");
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                return Ok(());
             }
+        }
+
+        // Check if review found critical issues
+        if review_round < MAX_REVIEW_ROUNDS && review_has_critical_issues(&review_output) {
+            println!("\n  ⚠ Critical issues found — sending back to coder for fixes");
+
+            let fix_prompt = format!(
+                "The reviewer found critical issues in your code. Fix them.\n\n\
+                 --- Original task ---\n{}\n\n\
+                 --- Your previous code ---\n{}\n\n\
+                 --- Reviewer's feedback ---\n{}\n\
+                 --- End ---\n\n\
+                 Fix all critical issues mentioned in the review.\n\
+                 Show the corrected code.",
+                task_desc, current_code, review_output
+            );
+
+            println!("\n── Coder fix (round {}) ──────────────────────────────────", review_round);
+            match run_react_step(
+                coder_arc, &fix_prompt, "cargo build 2>&1", MAX_REACT_ITERATIONS,
+            ).await {
+                Ok(fixed_code) => {
+                    if let Ok(mut brain) = brain_ref.lock() {
+                        let _ = brain.store_agent_result(
+                            "gsea-coder", &format!("[Coder/fix round {}] {}", review_round, task_desc),
+                            &fixed_code[..fixed_code.len().min(2000)], Some(&workflow_id.to_string()),
+                        );
+                    }
+                    current_code = fixed_code;
+                    // Continue to next review round
+                }
+                Err(e) => {
+                    eprintln!("[gsea-coder] Fix error: {}", e);
+                    break; // proceed with current code
+                }
+            }
+        } else {
+            // Review passed or max rounds reached
+            if review_round > 1 {
+                println!("\n  ✓ Review passed after {} rounds", review_round);
+            }
+            break;
         }
     }
 
+    // ── Step 3: Tester ──────────────────────────────────────────────
+    println!("\n── Step 3/3: Tester ──────────────────────────────────");
+
+    let test_prompt = format!(
+        "Original task: {}\n\n\
+         --- Coder's output ---\n{}\n\
+         --- Reviewer's feedback ---\n{}\n\
+         --- End ---\n\n\
+         Write comprehensive tests for the implementation above.\n\
+         Cover: happy path, edge cases, error paths.\n\
+         Show the test code and describe what each test verifies.",
+        task_desc, current_code, review_output
+    );
+
+    let task_id = uuid::Uuid::new_v4();
+    orch_ref.tell(OrchestratorMessage::SubmitTask(AgentTask {
+        task_id,
+        description: format!("Tester: {}", &task_desc[..task_desc.len().min(60)]),
+        input: serde_json::json!({ "prompt": &test_prompt[..test_prompt.len().min(200)] }),
+        priority: TaskPriority::Normal,
+        timeout_ms: 120_000,
+    })).await?;
+
+    // Tester also uses ReAct to verify tests pass
+    let tester_output = match run_react_step(
+        tester_arc, &test_prompt, "cargo test 2>&1", MAX_REACT_ITERATIONS,
+    ).await {
+        Ok(text) => {
+            orch_ref.tell(OrchestratorMessage::CompleteTask {
+                task_id, result: serde_json::json!({ "status": "ok" }),
+            }).await?;
+            if let Ok(mut brain) = brain_ref.lock() {
+                let _ = brain.store_agent_result(
+                    "gsea-tester", &format!("[Tester/ReAct] {}", task_desc),
+                    &text[..text.len().min(2000)], Some(&workflow_id.to_string()),
+                );
+            }
+            text
+        }
+        Err(e) => {
+            eprintln!("[gsea-tester] Error: {}", e);
+            orch_ref.tell(OrchestratorMessage::FailTask {
+                task_id, error: e.to_string(),
+            }).await?;
+            String::from("(tester failed)")
+        }
+    };
+
     // Summary
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    if failed {
-        println!("Workflow FAILED (completed {}/{} steps)", step_outputs.len(), steps.len());
-        println!("Workflow ID: {}", workflow_id);
-    } else {
-        println!("Workflow COMPLETED ({}/{} steps)", step_outputs.len(), steps.len());
-        println!("Workflow ID: {}", workflow_id);
-        println!("  coder:    {} chars", step_outputs.get(0).map(|s| s.len()).unwrap_or(0));
-        println!("  reviewer: {} chars", step_outputs.get(1).map(|s| s.len()).unwrap_or(0));
-        println!("  tester:   {} chars", step_outputs.get(2).map(|s| s.len()).unwrap_or(0));
-    }
+    println!("Workflow COMPLETED (3/3 steps)");
+    println!("Workflow ID: {}", workflow_id);
+    println!("  coder:    {} chars", current_code.len());
+    println!("  reviewer: {} chars", review_output.len());
+    println!("  tester:   {} chars", tester_output.len());
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     Ok(())
