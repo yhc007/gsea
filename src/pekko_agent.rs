@@ -28,8 +28,14 @@ use pekko_agent_core::{
     ToolDefinition, UserQuery,
 };
 use pekko_actor::{Actor, ActorContext};
+use pekko_agent_events::{
+    AgentEventEnvelope,
+    EventPublisher,
+    schema::event_types,
+};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::agent::Agent;
 
@@ -53,6 +59,10 @@ pub struct GseaPekkoAgent {
     /// Cached `ToolDefinition`s built from the agent's `ToolRegistry` at
     /// construction time.
     pub tool_defs: Vec<ToolDefinition>,
+
+    /// Event publisher — emits `AgentEventEnvelope` messages on every state
+    /// transition so downstream consumers can observe the agent's FSM.
+    pub events: EventPublisher,
 }
 
 // ─── Constructor ─────────────────────────────────────────────────────────────
@@ -83,6 +93,7 @@ impl GseaPekkoAgent {
             state: AgentState::Idle,
             agent: Arc::new(Mutex::new(Some(agent))),
             tool_defs,
+            events: EventPublisher::new("agent-events", 100),
         }
     }
 
@@ -157,6 +168,33 @@ impl GseaPekkoAgent {
         );
         self.state = new_state;
     }
+
+    /// Emit a `state.changed` event for the current FSM state.
+    ///
+    /// Failures are logged but not propagated — event publishing is
+    /// best-effort and must not abort the actor's message loop.
+    async fn emit_state_event(&self, correlation_id: Uuid) {
+        let state_label = match &self.state {
+            AgentState::Idle => "idle",
+            AgentState::Reasoning { .. } => "reasoning",
+            AgentState::Acting { .. } => "acting",
+            AgentState::Observing { .. } => "observing",
+            AgentState::Responding { .. } => "responding",
+            AgentState::Error { .. } => "error",
+        };
+
+        let envelope = AgentEventEnvelope::new(
+            &self.id,
+            event_types::STATE_CHANGED,
+            "default",
+            correlation_id,
+            serde_json::json!({ "state": state_label, "agent_id": self.id }),
+        );
+
+        if let Err(e) = self.events.publish(envelope).await {
+            warn!(agent_id = %self.id, error = %e, "Failed to publish state-change event");
+        }
+    }
 }
 
 // ─── pekko_actor::Actor impl ──────────────────────────────────────────────────
@@ -181,11 +219,13 @@ impl Actor for GseaPekkoAgent {
                     "Received Query"
                 );
 
+                let correlation_id = query.session_id;
                 self.set_state(AgentState::Reasoning {
                     query: query.content.clone(),
                     iteration: 1,
                     thought_chain: vec![],
                 });
+                self.emit_state_event(correlation_id).await;
 
                 match self.run_inner(&query.content).await {
                     Ok(reply) => {
@@ -195,6 +235,7 @@ impl Actor for GseaPekkoAgent {
                             "Query processed successfully"
                         );
                         self.set_state(AgentState::Idle);
+                        self.emit_state_event(correlation_id).await;
                     }
                     Err(e) => {
                         error!(agent_id = %self.id, error = %e, "Error processing query");
@@ -202,6 +243,7 @@ impl Actor for GseaPekkoAgent {
                             error: e.to_string(),
                             recoverable: true,
                         });
+                        self.emit_state_event(correlation_id).await;
                     }
                 }
             }
@@ -213,6 +255,7 @@ impl Actor for GseaPekkoAgent {
                     "Received Execute"
                 );
 
+                let correlation_id = Uuid::new_v4();
                 let prompt = match &action {
                     AgentAction::UseTool(calls) => {
                         let names: Vec<_> = calls.iter().map(|c| c.name.as_str()).collect();
@@ -228,15 +271,20 @@ impl Actor for GseaPekkoAgent {
                     tool_calls: vec![],
                     pending: 0,
                 });
+                self.emit_state_event(correlation_id).await;
 
                 match self.run_inner(&prompt).await {
-                    Ok(_) => self.set_state(AgentState::Idle),
+                    Ok(_) => {
+                        self.set_state(AgentState::Idle);
+                        self.emit_state_event(correlation_id).await;
+                    }
                     Err(e) => {
                         error!(agent_id = %self.id, error = %e, "Error executing action");
                         self.set_state(AgentState::Error {
                             error: e.to_string(),
                             recoverable: true,
                         });
+                        self.emit_state_event(correlation_id).await;
                     }
                 }
             }
@@ -249,6 +297,7 @@ impl Actor for GseaPekkoAgent {
                     "Received Respond with observations"
                 );
 
+                let correlation_id = Uuid::new_v4();
                 let obs_text = observations
                     .iter()
                     .map(|o| {
@@ -270,15 +319,20 @@ impl Actor for GseaPekkoAgent {
                 self.set_state(AgentState::Responding {
                     draft: obs_text.clone(),
                 });
+                self.emit_state_event(correlation_id).await;
 
                 match self.run_inner(&prompt).await {
-                    Ok(_) => self.set_state(AgentState::Idle),
+                    Ok(_) => {
+                        self.set_state(AgentState::Idle);
+                        self.emit_state_event(correlation_id).await;
+                    }
                     Err(e) => {
                         error!(agent_id = %self.id, error = %e, "Error synthesising response");
                         self.set_state(AgentState::Error {
                             error: e.to_string(),
                             recoverable: true,
                         });
+                        self.emit_state_event(correlation_id).await;
                     }
                 }
             }
@@ -456,6 +510,7 @@ mod tests {
             state: AgentState::Idle,
             agent: Arc::new(Mutex::new(None)), // intentionally empty
             tool_defs: vec![],
+            events: pekko_agent_events::EventPublisher::new("agent-events", 100),
         }
     }
 
@@ -661,5 +716,63 @@ mod tests {
         let response = agent.respond(&[]).await.unwrap();
         assert!(!response.content.is_empty());
         assert!(response.citations.is_empty());
+    }
+
+    // ── EventPublisher: events are emitted on state transitions ──────────────
+
+    #[tokio::test]
+    async fn emit_state_event_publishes_to_bus() {
+        use pekko_event_bus::EventBusHandle;
+
+        let agent = make_stub("event-test");
+
+        // Capture the bus handle before emitting so we can read back messages.
+        let bus_handle: EventBusHandle = agent.events.bus_handle();
+
+        // Emit a `state.changed` event directly.
+        agent.emit_state_event(uuid::Uuid::new_v4()).await;
+
+        // The bus should now have exactly one message on the "agent-events" topic.
+        let messages = bus_handle
+            .read_all("agent-events")
+            .expect("read_all should succeed");
+        assert_eq!(messages.len(), 1, "expected exactly one published event");
+
+        // Deserialise and verify the envelope fields.
+        let envelope: pekko_agent_events::AgentEventEnvelope =
+            serde_json::from_slice(&messages[0]).expect("envelope must deserialise");
+        assert_eq!(envelope.source_service, "event-test");
+        assert_eq!(envelope.event_type, pekko_agent_events::schema::event_types::STATE_CHANGED);
+    }
+
+    #[tokio::test]
+    async fn transition_emits_state_event_via_helper() {
+        let mut agent = make_stub("event-test-2");
+        let bus_handle = agent.events.bus_handle();
+
+        // Transition to Reasoning and emit.
+        agent.set_state(AgentState::Reasoning {
+            query: "test".to_string(),
+            iteration: 1,
+            thought_chain: vec![],
+        });
+        agent.emit_state_event(uuid::Uuid::new_v4()).await;
+
+        // Transition back to Idle and emit.
+        agent.set_state(AgentState::Idle);
+        agent.emit_state_event(uuid::Uuid::new_v4()).await;
+
+        let messages = bus_handle.read_all("agent-events").expect("read_all");
+        assert_eq!(messages.len(), 2, "expected two events (reasoning + idle)");
+
+        // First event should say reasoning.
+        let first: pekko_agent_events::AgentEventEnvelope =
+            serde_json::from_slice(&messages[0]).unwrap();
+        assert_eq!(first.payload["state"].as_str().unwrap(), "reasoning");
+
+        // Second event should say idle.
+        let second: pekko_agent_events::AgentEventEnvelope =
+            serde_json::from_slice(&messages[1]).unwrap();
+        assert_eq!(second.payload["state"].as_str().unwrap(), "idle");
     }
 }

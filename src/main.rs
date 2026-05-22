@@ -7,6 +7,7 @@ mod gui;
 mod llm;
 mod mcp_server;
 mod memory_brain;
+mod memory_system;
 mod pekko_agent;
 mod tools;
 
@@ -373,10 +374,16 @@ async fn run_interactive(
 /// Responses are delivered asynchronously through the actor's `receive` loop
 /// and appear in the tracing log output.  This is fire-and-forget for now;
 /// a request-response channel can be wired in a later task.
+///
+/// Extra REPL commands:
+///   `/memory <text>` — store `<text>` as a CLS episodic memory
+///   `/dream`         — run one offline consolidation pass
 async fn run_pekko(agent: Agent) -> Result<()> {
     println!("GSEA Pekko Mode — ActorSystem starting…");
     println!("  Responses are printed via tracing (look for INFO lines)");
     println!("  Type 'exit' or 'quit' to stop");
+    println!("  /memory <text>  — store a CLS memory");
+    println!("  /dream          — run dream consolidation");
     println!("{}", "─".repeat(50));
 
     // Boot the ActorSystem.
@@ -388,6 +395,17 @@ async fn run_pekko(agent: Agent) -> Result<()> {
     // Spawn into the system; returns a fire-and-forget ActorRef.
     let actor_ref = system.spawn(pekko_agent, "gsea-main").await?;
     tracing::info!(actor = %actor_ref.name(), "GseaPekkoAgent spawned");
+
+    // Boot the CLS MemorySystem and print initial stats.
+    let mut mem = memory_system::MemorySystem::new();
+    {
+        let s = mem.stats();
+        println!(
+            "CLS MemorySystem ready — {} memories, {} concepts",
+            s.total_memories, s.total_concepts
+        );
+    }
+    println!("{}", "─".repeat(50));
 
     // REPL loop.
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -401,6 +419,30 @@ async fn run_pekko(agent: Agent) -> Result<()> {
                     "exit" | "quit" => {
                         println!("Goodbye!");
                         break;
+                    }
+                    "/dream" => {
+                        println!("Running dream consolidation…");
+                        mem.dream();
+                        let s = mem.stats();
+                        println!(
+                            "Done — {} memories, {} concepts, last_run: {:?}",
+                            s.total_memories,
+                            s.total_concepts,
+                            s.dream_last_run
+                        );
+                        continue;
+                    }
+                    cmd if cmd.starts_with("/memory ") => {
+                        let content = cmd.trim_start_matches("/memory ").trim();
+                        if content.is_empty() {
+                            println!("Usage: /memory <text>");
+                        } else {
+                            let id = mem.store(content);
+                            println!("Memory stored — id: {id}");
+                            let s = mem.stats();
+                            println!("  total memories: {}", s.total_memories);
+                        }
+                        continue;
                     }
                     _ => {}
                 }

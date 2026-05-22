@@ -29,6 +29,7 @@ eframe = "0.31"
 
 # pekko-agent dependencies
 pekko-actor = { path = "../rust-pekko/pekko-actor" }
+memory-actor = { path = "vendor/memory-brain/crates/memory-actor" }
 pekko-agent-core = { path = "../pekko-agent/crates/pekko-agent-core" }
 pekko-agent-memory = { path = "../pekko-agent/crates/pekko-agent-memory" }
 pekko-agent-tools = { path = "../pekko-agent/crates/pekko-agent-tools" }
@@ -37,3 +38,4 @@ pekko-agent-events = { path = "../pekko-agent/crates/pekko-agent-events" }
 
 [dev-dependencies]
 tempfile = "3"
+pekko-event-bus = { path = "../rust-pekko/pekko-event-bus" }
