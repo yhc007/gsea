@@ -1,44 +1,46 @@
 //! GPU-accelerated GUI for GSEA using egui + eframe (wgpu backend).
-//! DeepSeek TUI-style split panel layout.
+//! Non-blocking UI with waiting indicator and model switcher.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 
-use eframe::egui;
+use eframe::egui::{self, Color32, CornerRadius, Vec2, FontFamily, FontId};
 
 use crate::agent::Agent;
-use crate::memory_brain::{Brain, MemoryType};
+use crate::memory_brain::Brain;
 use crate::tools::ToolRegistry;
 
-/// Chat message display
 #[derive(Clone)]
 struct ChatMessage {
     role: String,
     content: String,
 }
 
-/// GSEA GUI application
-pub struct GseaGui {
-    agent: Option<Agent>,
-    brain: Arc<std::sync::Mutex<Brain>>,
-    registry: Arc<std::sync::Mutex<ToolRegistry>>,
+enum GuiEvent {
+    Response(String),
+    Error(String),
+    StatsUpdate(String, usize), // (brain_stats_json, tool_count)
+}
 
+pub struct GseaGui {
+    agent: Arc<Mutex<Option<Agent>>>,
+    brain: Arc<Mutex<Brain>>,
+    registry: Arc<Mutex<ToolRegistry>>,
     messages: Vec<ChatMessage>,
     input_buf: String,
-
-    // Cached state
     brain_stats: String,
     tool_count: usize,
     model_name: String,
-
-    // Scroll state
-    auto_scroll: bool,
+    is_processing: bool,
+    rx: mpsc::Receiver<GuiEvent>,
+    tx: mpsc::Sender<GuiEvent>,
 }
 
 impl GseaGui {
     pub fn new(
         agent: Option<Agent>,
-        brain: Arc<std::sync::Mutex<Brain>>,
-        registry: Arc<std::sync::Mutex<ToolRegistry>>,
+        brain: Arc<Mutex<Brain>>,
+        registry: Arc<Mutex<ToolRegistry>>,
         model_name: &str,
     ) -> Self {
         let stats = {
@@ -46,157 +48,223 @@ impl GseaGui {
             serde_json::to_string_pretty(&b.stats()).unwrap_or_default()
         };
         let tc = registry.lock().unwrap().list_tools().len();
+        let (tx, rx) = mpsc::channel();
 
         Self {
-            agent,
-            brain,
-            registry,
+            agent: Arc::new(Mutex::new(agent)),
+            brain, registry,
             messages: Vec::new(),
             input_buf: String::new(),
             brain_stats: stats,
             tool_count: tc,
             model_name: model_name.to_string(),
-            auto_scroll: true,
+            is_processing: false,
+            rx, tx,
         }
     }
 
-    fn add_message(&mut self, role: &str, content: &str) {
-        let msg = ChatMessage {
-            role: role.to_string(),
-            content: content.to_string(),
-        };
-        self.messages.push(msg);
-        self.auto_scroll = true;
-    }
+    fn send_message(&mut self, input: &str) {
+        let input = input.to_string();
+        self.messages.push(ChatMessage { role: "You".into(), content: input.clone() });
+        self.is_processing = true;
 
-    fn refresh_stats(&mut self) {
-        let b = self.brain.lock().unwrap();
-        self.brain_stats = serde_json::to_string_pretty(&b.stats()).unwrap_or_default();
-        self.tool_count = self.registry.lock().unwrap().list_tools().len();
+        let agent = self.agent.clone();
+        let brain = self.brain.clone();
+        let registry = self.registry.clone();
+        let tx = self.tx.clone();
+
+        thread::spawn(move || {
+            let tokio_rt = tokio::runtime::Runtime::new();
+            match tokio_rt {
+                Ok(rt) => {
+                    let mut ag = agent.lock().unwrap();
+                    if let Some(ref mut a) = *ag {
+                        match rt.block_on(a.process_message(&input)) {
+                            Ok(r) => {
+                                let _ = tx.send(GuiEvent::Response(r));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(GuiEvent::Error(e.to_string()));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(GuiEvent::Error(format!("Runtime error: {}", e)));
+                }
+            }
+
+            // Update stats
+            let b = brain.lock().unwrap();
+            let stats = serde_json::to_string_pretty(&b.stats()).unwrap_or_default();
+            let tc = registry.lock().unwrap().list_tools().len();
+            let _ = tx.send(GuiEvent::StatsUpdate(stats, tc));
+        });
     }
+}
+
+fn setup_korean_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Ok(data) = std::fs::read("/System/Library/Fonts/AppleSDGothicNeo.ttc") {
+        fonts.font_data.insert("korean".to_string(), std::sync::Arc::new(egui::FontData::from_owned(data)));
+        fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "korean".to_string());
+    }
+    ctx.set_fonts(fonts);
 }
 
 impl eframe::App for GseaGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ─── Top panel: title ────────────────────────────────────
-        egui::TopBottomPanel::top("title_bar").show(ctx, |ui| {
+        setup_korean_font(ctx);
+
+        // Drain pending events from the channel
+        while let Ok(event) = self.rx.try_recv() {
+            match event {
+                GuiEvent::Response(text) => {
+                    self.messages.push(ChatMessage { role: "GSEA".into(), content: text });
+                    self.is_processing = false;
+                }
+                GuiEvent::Error(text) => {
+                    self.messages.push(ChatMessage { role: "Error".into(), content: text });
+                    self.is_processing = false;
+                }
+                GuiEvent::StatsUpdate(stats, tc) => {
+                    self.brain_stats = stats;
+                    self.tool_count = tc;
+                }
+            }
+        }
+
+        // Header with model switcher
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("⚡ GSEA");
-                ui.label("Gemma Self-Evolving Agent");
+                ui.heading(egui::RichText::new("⚡ GSEA").color(Color32::from_rgb(100, 180, 255)));
+                ui.label(egui::RichText::new("Gemma Self-Evolving Agent").color(Color32::GRAY).size(13.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(&self.model_name);
+                    let models = ["gemma4:26b", "qwen3:8b", "auto"];
+                    let mut current_idx = match self.model_name.as_str() {
+                        "gemma4:26b" => 0,
+                        "qwen3:8b" => 1,
+                        _ => 2,
+                    };
+                    egui::ComboBox::from_id_salt("model_selector")
+                        .selected_text(&self.model_name)
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            for (i, m) in models.iter().enumerate() {
+                                if ui.selectable_value(&mut current_idx, i, *m).clicked() {
+                                    self.model_name = m.to_string();
+                                    if let Ok(mut ag) = self.agent.lock() {
+                                        if let Some(ref mut agent) = *ag {
+                                            match *m {
+                                                "gemma4:26b" => { agent.llm().set_model("gemma4:26b"); agent.fast_llm().set_model("qwen3:8b"); }
+                                                "qwen3:8b" => { agent.llm().set_model("qwen3:8b"); agent.fast_llm().set_model("qwen3:8b"); }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
                 });
             });
         });
 
-        // ─── Bottom panel: input ─────────────────────────────────
-        egui::TopBottomPanel::bottom("input_bar").show(ctx, |ui| {
+        // Input bar
+        egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let resp = ui.add_sized(
-                    ui.available_size() - egui::vec2(80.0, 0.0),
+                    ui.available_size() - Vec2::new(90.0, 0.0),
                     egui::TextEdit::singleline(&mut self.input_buf)
-                        .hint_text("Type a message...")
+                        .hint_text(if self.is_processing { "⏳ 처리 중..." } else { "메시지를 입력하세요..." })
+                        .font(FontId::new(14.0, FontFamily::Proportional))
                         .desired_width(f32::INFINITY),
                 );
 
-                let send_clicked = ui.button("⏎ Send").clicked()
-                    || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                let btn_label = if self.is_processing { "⏳" } else { "⏎ 전송" };
+                let btn = egui::Button::new(egui::RichText::new(btn_label).size(14.0).color(Color32::WHITE))
+                    .fill(if self.is_processing { Color32::from_rgb(80, 80, 80) } else { Color32::from_rgb(50, 120, 220) })
+                    .min_size(Vec2::new(80.0, 28.0));
 
-                if send_clicked && !self.input_buf.is_empty() {
+                let should_send = !self.is_processing && !self.input_buf.trim().is_empty()
+                    && (ui.add(btn).clicked() || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))));
+
+                if should_send {
                     let input = self.input_buf.trim().to_string();
                     self.input_buf.clear();
-                    self.add_message("You", &input);
-
-                    // Process via agent (synchronously for now — will spawn task later)
-                    if let Some(ref mut agent) = self.agent {
-                        let fut = agent.process_message(&input);
-                        match futures::executor::block_on(fut) {
-                            Ok(response) => {
-                                self.add_message("GSEA", &response);
-                            }
-                            Err(e) => {
-                                self.add_message("Error", &e.to_string());
-                            }
-                        }
-                    } else {
-                        self.add_message("GSEA", "Agent not initialized");
-                    }
-
-                    self.refresh_stats();
-                    resp.request_focus();
+                    self.send_message(&input);
                 }
-
-                if !resp.has_focus() {
-                    resp.request_focus();
-                }
+                if !resp.has_focus() && !self.is_processing { resp.request_focus(); }
             });
         });
 
-        // ─── Status bar ──────────────────────────────────────────
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+        // Status bar
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(format!("💬 {} messages", self.messages.len()));
-                ui.separator();
-                ui.label(format!("🧠 memory"));
-                ui.separator();
-                ui.label(format!("🔧 {} tools", self.tool_count));
-                ui.separator();
-                ui.label(format!("📡 {}", self.model_name));
+                let status = if self.is_processing {
+                    format!("⏳ waiting... | 💬 {} | 🔧 {} tools | {}", self.messages.len(), self.tool_count, self.model_name)
+                } else {
+                    format!("💬 {} | 🔧 {} tools | {}", self.messages.len(), self.tool_count, self.model_name)
+                };
+                ui.label(egui::RichText::new(status).size(11.0).color(Color32::GRAY));
             });
         });
 
-        // ─── Right panel: info sidebar ───────────────────────────
-        egui::SidePanel::right("info_panel")
-            .resizable(true)
-            .default_width(220.0)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("🧠 Brain");
-                    ui.separator();
-                    ui.monospace(&self.brain_stats);
-                    ui.add_space(10.0);
-
-                    ui.heading("🔧 Tools");
-                    ui.separator();
-                    let tools = self.registry.lock().unwrap();
-                    for t in tools.list_tools() {
-                        ui.label(t.name());
+        // Sidebar
+        egui::SidePanel::right("sidebar").resizable(true).default_width(220.0).show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.label(egui::RichText::new("🧠 Brain").size(14.0).strong());
+                ui.separator();
+                ui.monospace(egui::RichText::new(&self.brain_stats).size(11.0).color(Color32::LIGHT_GRAY));
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("🔧 Tools").size(14.0).strong());
+                ui.separator();
+                let tools = self.registry.lock().unwrap();
+                for t in tools.list_tools() {
+                    ui.label(egui::RichText::new(format!("• {}", t.name())).size(12.0).color(Color32::from_rgb(180, 190, 200)));
+                }
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("💡 Skills").size(14.0).strong());
+                ui.separator();
+                let b = self.brain.lock().unwrap();
+                let skills = b.list_skills();
+                if skills.is_empty() {
+                    ui.label(egui::RichText::new("(none)").color(Color32::GRAY).size(12.0));
+                } else {
+                    for (name, desc) in &skills {
+                        ui.label(egui::RichText::new(format!("• {}: {}", name, desc)).size(11.0).color(Color32::from_rgb(160, 200, 160)));
                     }
-                    ui.add_space(10.0);
-
-                    ui.heading("💡 Skills");
-                    ui.separator();
-                    let b = self.brain.lock().unwrap();
-                    let skills = b.list_skills();
-                    if skills.is_empty() {
-                        ui.label("(none)");
-                    } else {
-                        for (name, desc) in &skills {
-                            ui.label(format!("• {}: {}", name, desc));
-                        }
-                    }
-                });
+                }
             });
+        });
 
-        // ─── Central panel: chat history ─────────────────────────
+        // Chat area with waiting overlay
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(f32::INFINITY)
-                .show(ui, |ui| {
-                    for msg in &self.messages {
-                        let color = match msg.role.as_str() {
-                            "You" => egui::Color32::LIGHT_BLUE,
-                            "Error" => egui::Color32::LIGHT_RED,
-                            _ => egui::Color32::WHITE,
-                        };
-                        ui.colored_label(color, format!("{}:", msg.role));
-                        ui.label(&msg.content);
-                        ui.separator();
-                    }
-                });
+            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                // Waiting indicator at top when processing
+                if self.is_processing {
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("⏳ waiting...").color(Color32::from_rgb(255, 200, 50)).size(16.0).strong());
+                        ui.label(egui::RichText::new("모델이 응답 중입니다").color(Color32::GRAY).size(12.0));
+                    });
+                    ui.add_space(8.0);
+                }
+
+                for msg in &self.messages {
+                    let is_user = msg.role == "You";
+                    let bg = if is_user { Color32::from_rgb(50, 80, 140) } else if msg.role == "Error" { Color32::from_rgb(120, 40, 40) } else { Color32::from_rgb(30, 34, 42) };
+                    let name_c = if is_user { Color32::from_rgb(100, 180, 255) } else { Color32::from_rgb(80, 220, 150) };
+                    ui.add_space(6.0);
+                    egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 10)).show(ui, |ui| {
+                        ui.label(egui::RichText::new(&msg.role).color(name_c).size(12.0).strong());
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(&msg.content).color(if is_user { Color32::WHITE } else { Color32::from_rgb(210, 215, 225) }).size(13.0));
+                    });
+                }
+                ui.add_space(20.0);
+            });
         });
 
-        // Repaint continuously for smooth interactivity
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
 }

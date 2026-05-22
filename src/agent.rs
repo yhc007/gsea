@@ -184,6 +184,16 @@ When you're done, provide a final response to the user."#,
         false
     }
 
+    /// Get a reference to the main LLM client (for GUI model switching).
+    pub fn llm(&mut self) -> &mut OllamaClient {
+        &mut self.llm
+    }
+
+    /// Get a reference to the fast LLM client.
+    pub fn fast_llm(&mut self) -> &mut OllamaClient {
+        &mut self.fast_llm
+    }
+
     /// Send a chat request using the appropriate model based on prompt complexity.
     /// Logs which model was selected.
     async fn chat_with_selected_model(&self, messages: Vec<Message>) -> Result<Message> {
@@ -213,7 +223,7 @@ When you're done, provide a final response to the user."#,
                             format!(
                                 "[{}] (sim: {:.2}) {}",
                                 item.memory_type, score,
-                                &item.content[..item.content.len().min(200)]
+                                item.content.chars().take(200).collect::<String>()
                             )
                         })
                         .collect();
@@ -233,7 +243,7 @@ When you're done, provide a final response to the user."#,
                             format!(
                                 "[{}] (strength: {:.2}) {}",
                                 item.memory_type, item.strength,
-                                &item.content[..item.content.len().min(200)]
+                                item.content.chars().take(200).collect::<String>()
                             )
                         })
                         .collect();
@@ -282,7 +292,8 @@ When you're done, provide a final response to the user."#,
 
         // 5. Store in memory (with embedding for future similarity search)
         {
-            let content = format!("User: {}\nAssistant: {}", user_input, &final_output[..final_output.len().min(300)]);
+            let truncated: String = final_output.chars().take(300).collect();
+            let content = format!("User: {}\nAssistant: {}", user_input, truncated);
             if let Ok(emb) = self.embedder.embed(&content).await {
                 let mut item = crate::memory_brain::MemoryItem::new(&content, crate::memory_brain::MemoryType::Episodic);
                 item.embedding = Some(emb);

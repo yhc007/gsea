@@ -55,6 +55,15 @@ impl OllamaClient {
         }
     }
 
+    /// Change the model at runtime (used by GUI model switcher).
+    pub fn set_model(&mut self, model: &str) {
+        self.model = model.to_string();
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
+
     /// Send a chat completion request (non-streaming).
     pub async fn chat(&self, messages: Vec<Message>) -> Result<Message> {
         let body = ChatRequest {
