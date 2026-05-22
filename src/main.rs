@@ -494,6 +494,7 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
     println!("  /workflow list               — list workflow templates");
     println!("  /workflow run <name> <task>  — run a named template");
     println!("  /workflow parallel <task>    — run coder+reviewer in parallel, then tester");
+    println!("  /goal <description>           — autonomous: decompose→plan→execute");
     println!("  /evolve [target]             — self-evolution: analyze→improve→verify");
     println!("  /evolve loop <N>             — run N evolution iterations");
     println!("  /broadcast <msg>             — broadcast message to all agents");
@@ -734,6 +735,17 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                             println!("Unknown agent: {}", target);
                             println!("Available: {}", agent_refs.keys().cloned().collect::<Vec<_>>().join(", "));
                         }
+                        continue;
+                    }
+                    cmd if cmd.starts_with("/goal ") => {
+                        let goal = cmd.trim_start_matches("/goal ").trim();
+                        if goal.is_empty() {
+                            println!("Usage: /goal <high-level goal description>");
+                            continue;
+                        }
+                        run_autonomous_goal(
+                            goal, &agent_arcs, &orch_ref, &brain_ref, &cli,
+                        ).await?;
                         continue;
                     }
                     cmd if cmd.starts_with("/evolve") => {
@@ -2193,4 +2205,278 @@ async fn store_memory_with_embedding(
     let brain = brain_ref.lock().unwrap();
     brain.consolidate_memory_public(item)?;
     Ok(id)
+}
+
+// ─── Autonomous Goal ──────────────────────────────────────────────────
+
+/// Autonomous goal execution: the coordinator agent decomposes a high-level
+/// goal into sub-tasks, then executes them one by one using the appropriate
+/// specialist agent with the appropriate model.
+///
+/// Flow:
+///   1. Coordinator analyzes goal → generates task plan (JSON)
+///   2. For each sub-task: pick agent + model tier → execute with ReAct
+///   3. Store results in Brain for future reference
+async fn run_autonomous_goal(
+    goal: &str,
+    agent_arcs: &std::collections::HashMap<String, SharedAgent>,
+    orch_ref: &ActorRef<OrchestratorMessage>,
+    brain_ref: &Arc<std::sync::Mutex<Brain>>,
+    _cli: &Cli,
+) -> Result<()> {
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Autonomous Goal Execution");
+    println!("Goal: {}", goal);
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    let main_arc = agent_arcs.get("gsea-main");
+    if main_arc.is_none() {
+        eprintln!("Main agent not available");
+        return Ok(());
+    }
+    let main_arc = main_arc.unwrap();
+
+    // ── Phase 1: Decompose goal into sub-tasks ────────────────────
+    println!("\n── Phase 1: Decomposing goal into sub-tasks ──────────────────");
+
+    // Gather context from memory
+    let memory_context = {
+        let brain = brain_ref.lock().unwrap();
+        let results = brain.recall(goal, 5);
+        if results.is_empty() {
+            String::new()
+        } else {
+            let lines: Vec<String> = results.iter()
+                .map(|item| format!("  - [{}] {}", item.memory_type, item.content.chars().take(100).collect::<String>()))
+                .collect();
+            format!("\nRelevant past context:\n{}\n", lines.join("\n"))
+        }
+    };
+
+    let decompose_prompt = format!(
+        r#"You are a task planner. Decompose this goal into concrete sub-tasks.
+{memory_context}
+Goal: {goal}
+
+Respond with a JSON array of sub-tasks. Each sub-task has:
+- "task": description of what to do
+- "agent": which agent should handle it ("gsea-coder", "gsea-reviewer", or "gsea-tester")
+- "complexity": "simple", "moderate", or "complex"
+- "verify_cmd": shell command to verify (empty string if none)
+
+Example:
+```json
+[
+  {{"task": "Write a retry utility function with exponential backoff", "agent": "gsea-coder", "complexity": "moderate", "verify_cmd": "cargo build 2>&1"}},
+  {{"task": "Review the retry utility for edge cases", "agent": "gsea-reviewer", "complexity": "simple", "verify_cmd": ""}},
+  {{"task": "Write tests for the retry utility", "agent": "gsea-tester", "complexity": "moderate", "verify_cmd": "cargo test 2>&1"}}
+]
+```
+
+Keep it to 2-5 sub-tasks. Be specific and actionable."#,
+    );
+
+    let plan_response = run_streaming_step(main_arc, &decompose_prompt).await?;
+
+    // Parse the task plan from the response
+    let tasks = parse_task_plan(&plan_response);
+    if tasks.is_empty() {
+        println!("  Could not parse task plan from response. Aborting.");
+        return Ok(());
+    }
+
+    println!("\n  Parsed {} sub-tasks:", tasks.len());
+    for (i, task) in tasks.iter().enumerate() {
+        let model_tier = select_model_tier(&task.complexity);
+        println!("  {}. [{}] [{}] {}", i + 1, task.agent, model_tier, task.task);
+    }
+
+    let workflow_id = uuid::Uuid::new_v4();
+
+    // ── Phase 2: Execute sub-tasks ────────────────────────────────
+    let mut step_outputs: Vec<String> = Vec::new();
+    let total = tasks.len();
+
+    for (i, task) in tasks.iter().enumerate() {
+        let model_tier = select_model_tier(&task.complexity);
+        println!("\n── Sub-task {}/{}: {} [{}] ──────────────────────────────",
+            i + 1, total, task.agent, model_tier);
+        println!("  {}", task.task);
+
+        let agent_arc = match agent_arcs.get(&task.agent) {
+            Some(a) => a,
+            None => {
+                eprintln!("  Agent {} not found, skipping", task.agent);
+                step_outputs.push(format!("(skipped: agent {} not found)", task.agent));
+                continue;
+            }
+        };
+
+        // Build prompt with context from previous steps
+        let prev_context = if step_outputs.is_empty() {
+            String::new()
+        } else {
+            let ctx: Vec<String> = step_outputs.iter().enumerate()
+                .map(|(j, o)| format!("--- Step {} output ---\n{}", j + 1,
+                    o.chars().take(1500).collect::<String>()))
+                .collect();
+            format!("\nPrevious step results:\n{}\n", ctx.join("\n\n"))
+        };
+
+        let task_prompt = format!(
+            "Goal: {}\n\nYour specific task: {}\n{}\n\
+             Execute this task. Be thorough but concise.",
+            goal, task.task, prev_context
+        );
+
+        // Submit to orchestrator
+        let task_id = uuid::Uuid::new_v4();
+        orch_ref.tell(OrchestratorMessage::SubmitTask(AgentTask {
+            task_id,
+            description: format!("Goal/{}: {}", i + 1, &task.task[..task.task.len().min(60)]),
+            input: serde_json::json!({
+                "goal": goal,
+                "sub_task": task.task,
+                "model_tier": model_tier,
+            }),
+            priority: TaskPriority::Normal,
+            timeout_ms: 180_000,
+        })).await?;
+
+        // Execute with ReAct if verify command is present
+        let max_react = match task.complexity.as_str() {
+            "complex" => 3,
+            "moderate" => 2,
+            _ => 1,
+        };
+
+        let output = match run_react_step(
+            agent_arc, &task_prompt, &task.verify_cmd, max_react,
+        ).await {
+            Ok(text) => {
+                orch_ref.tell(OrchestratorMessage::CompleteTask {
+                    task_id,
+                    result: serde_json::json!({ "status": "ok", "model_tier": model_tier }),
+                }).await?;
+                // Store in Brain
+                if let Ok(mut brain) = brain_ref.lock() {
+                    let _ = brain.store_agent_result(
+                        &task.agent,
+                        &format!("[Goal/step {}] {}", i + 1, task.task),
+                        &text[..text.len().min(2000)],
+                        Some(&workflow_id.to_string()),
+                    );
+                }
+                text
+            }
+            Err(e) => {
+                eprintln!("  Sub-task failed: {}", e);
+                orch_ref.tell(OrchestratorMessage::FailTask {
+                    task_id, error: e.to_string(),
+                }).await?;
+                format!("(failed: {})", e)
+            }
+        };
+
+        step_outputs.push(output);
+    }
+
+    // ── Summary ───────────────────────────────────────────────────
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Autonomous Goal COMPLETED");
+    println!("Goal: {}", goal);
+    println!("Workflow ID: {}", workflow_id);
+    for (i, task) in tasks.iter().enumerate() {
+        let output_len = step_outputs.get(i).map(|s| s.len()).unwrap_or(0);
+        let model_tier = select_model_tier(&task.complexity);
+        println!("  {}. [{}] [{}] {} chars", i + 1, task.agent, model_tier, output_len);
+    }
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    // Store the complete goal result in Brain
+    if let Ok(mut brain) = brain_ref.lock() {
+        let summary: String = step_outputs.iter().enumerate()
+            .map(|(i, o)| format!("Step {}: {} chars", i + 1, o.len()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = brain.store_agent_result(
+            "gsea-main",
+            &format!("[Goal] {}", goal),
+            &format!("{} sub-tasks completed: {}", tasks.len(), summary),
+            Some(&workflow_id.to_string()),
+        );
+    }
+
+    Ok(())
+}
+
+/// A parsed sub-task from the coordinator's task plan.
+struct SubTask {
+    task: String,
+    agent: String,
+    complexity: String,
+    verify_cmd: String,
+}
+
+/// Parse a JSON task plan from the coordinator's response.
+/// Extracts the JSON array from markdown code blocks if present.
+fn parse_task_plan(response: &str) -> Vec<SubTask> {
+    // Try to extract JSON from code block
+    let json_str = if let Some(start) = response.find("```json") {
+        let after = &response[start + 7..];
+        if let Some(end) = after.find("```") {
+            &after[..end]
+        } else {
+            after
+        }
+    } else if let Some(start) = response.find('[') {
+        // Try to find raw JSON array
+        if let Some(end) = response.rfind(']') {
+            &response[start..=end]
+        } else {
+            return Vec::new();
+        }
+    } else {
+        return Vec::new();
+    };
+
+    // Parse JSON
+    let parsed: Result<Vec<serde_json::Value>, _> = serde_json::from_str(json_str.trim());
+    match parsed {
+        Ok(items) => {
+            items.iter().filter_map(|item| {
+                let task = item.get("task")?.as_str()?.to_string();
+                let agent = item.get("agent")?.as_str()?.to_string();
+                let complexity = item.get("complexity")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("moderate")
+                    .to_string();
+                let verify_cmd = item.get("verify_cmd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some(SubTask { task, agent, complexity, verify_cmd })
+            }).collect()
+        }
+        Err(e) => {
+            eprintln!("  JSON parse error: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+// ─── Multi-Model Strategy ─────────────────────────────────────────────
+
+/// Select model tier based on task complexity.
+/// Returns a label ("fast" or "main") indicating which model to prefer.
+///
+/// This is used at the workflow/goal level to inform the user and for
+/// future model routing. The actual model selection happens inside Agent
+/// via `needs_complex_model()` which examines the prompt content.
+fn select_model_tier(complexity: &str) -> &'static str {
+    match complexity {
+        "simple" => "fast",
+        "complex" => "main",
+        _ => "main", // default to main for moderate and unknown
+    }
 }

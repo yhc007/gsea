@@ -169,6 +169,11 @@ When you're done, provide a final response to the user."#,
             "rust", "compile", "refactor", "optimize", "review",
             "debug", "analyze", "memory", "async", "unsafe",
             "cargo", "build", "test", "benchmark",
+            // Goal/plan decomposition needs the main model
+            "goal:", "decompose", "sub-task", "plan",
+            // Multi-step reasoning
+            "implement", "design", "architect", "integrate",
+            "error", "fix", "bug", "issue", "problem",
         ];
         let lower = trimmed.to_lowercase();
         if complex_patterns.iter().any(|p| lower.contains(p)) {
