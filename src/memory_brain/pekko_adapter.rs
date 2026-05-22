@@ -164,11 +164,17 @@ impl ShortTermMemory for BrainShortTermMemory {
 /// - `delete` → [`Brain::forget`] (removes from all stores)
 pub struct BrainLongTermMemory {
     brain: Arc<Mutex<Brain>>,
+    embedder: Option<Arc<dyn crate::llm::embedding::EmbeddingEngine>>,
 }
 
 impl BrainLongTermMemory {
     pub fn new(brain: Arc<Mutex<Brain>>) -> Self {
-        Self { brain }
+        Self { brain, embedder: None }
+    }
+
+    /// Create with an embedding engine for semantic search.
+    pub fn with_embedder(brain: Arc<Mutex<Brain>>, embedder: Arc<dyn crate::llm::embedding::EmbeddingEngine>) -> Self {
+        Self { brain, embedder: Some(embedder) }
     }
 
     /// Convenience constructor: creates its own `Brain` from `storage_path`.
@@ -205,13 +211,36 @@ impl LongTermMemory for BrainLongTermMemory {
     }
 
     async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>, MemoryError> {
+        // Try embedding-based search first if embedder is available
+        if let Some(ref embedder) = self.embedder {
+            if let Ok(query_emb) = embedder.embed(query).await {
+                let brain = self.brain.lock().unwrap();
+                let items = brain.recall_by_similarity(&query_emb, top_k, 0.3);
+                if !items.is_empty() {
+                    return Ok(items
+                        .into_iter()
+                        .map(|(item, score)| {
+                            let source = extract_source(&item.content)
+                                .unwrap_or_else(|| "brain".to_string());
+                            SearchResult {
+                                id: item.id.to_string(),
+                                score: score as f32,
+                                content: strip_prefixes(&item.content),
+                                source,
+                            }
+                        })
+                        .collect());
+                }
+            }
+        }
+
+        // Fallback to keyword search
         let brain = self.brain.lock().unwrap();
         let items = brain.recall(query, top_k);
 
         let results = items
             .into_iter()
             .map(|item| {
-                // Extract source from encoded prefix if present
                 let source = extract_source(&item.content)
                     .unwrap_or_else(|| "brain".to_string());
                 SearchResult {
@@ -418,6 +447,18 @@ mod tests {
         // After deletion it should no longer appear
         let after = mem.search("deleted", 10).await.unwrap();
         assert!(after.iter().all(|r| r.id != id));
+    }
+
+    #[tokio::test]
+    async fn brain_long_term_search_with_embedder_fallback() {
+        // Without an embedder, search should still work (keyword fallback)
+        let dir = tempdir().unwrap();
+        let brain = make_brain(dir.path().to_str().unwrap());
+        let mem = BrainLongTermMemory::new(brain);
+
+        mem.store(make_doc("semantic search test document")).await.unwrap();
+        let results = mem.search("semantic", 10).await.unwrap();
+        assert!(!results.is_empty());
     }
 
     // ── helper unit tests ────────────────────────────────────────────────────

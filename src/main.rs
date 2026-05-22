@@ -369,18 +369,15 @@ async fn run_interactive(
 // ─── Pekko Actor Mode ──────────────────────────────────────────────────────
 
 /// Start an `ActorSystem`, spawn a `GseaPekkoAgent`, and run an interactive
-/// REPL that sends `AgentMessage::Query` messages via the actor mailbox.
+/// REPL that sends `AgentMessage::QueryWithReply` via the ask() pattern.
 ///
-/// Responses are delivered asynchronously through the actor's `receive` loop
-/// and appear in the tracing log output.  This is fire-and-forget for now;
-/// a request-response channel can be wired in a later task.
+/// Responses are returned synchronously to the REPL through a oneshot channel.
 ///
 /// Extra REPL commands:
 ///   `/memory <text>` — store `<text>` as a CLS episodic memory
 ///   `/dream`         — run one offline consolidation pass
 async fn run_pekko(agent: Agent) -> Result<()> {
     println!("GSEA Pekko Mode — ActorSystem starting…");
-    println!("  Responses are printed via tracing (look for INFO lines)");
     println!("  Type 'exit' or 'quit' to stop");
     println!("  /memory <text>  — store a CLS memory");
     println!("  /dream          — run dream consolidation");
@@ -392,7 +389,7 @@ async fn run_pekko(agent: Agent) -> Result<()> {
     // Wrap the GSEA Agent in a GseaPekkoAgent actor.
     let pekko_agent = GseaPekkoAgent::new("gsea-main", agent);
 
-    // Spawn into the system; returns a fire-and-forget ActorRef.
+    // Spawn into the system; returns an ActorRef supporting tell() and ask().
     let actor_ref = system.spawn(pekko_agent, "gsea-main").await?;
     tracing::info!(actor = %actor_ref.name(), "GseaPekkoAgent spawned");
 
@@ -464,10 +461,24 @@ async fn run_pekko(agent: Agent) -> Result<()> {
                     },
                 };
 
-                // Fire-and-forget: the actor processes the message and logs
-                // the response via tracing.
-                actor_ref.tell(AgentMessage::Query(query)).await?;
-                println!("(message sent — watch tracing output for the response)");
+                // Request-response via the ask() pattern.
+                let response = actor_ref.ask(
+                    |reply_tx| AgentMessage::QueryWithReply(query, reply_tx),
+                    std::time::Duration::from_secs(120),
+                ).await;
+
+                match response {
+                    Ok(Ok(text)) => {
+                        println!("\n{}", text);
+                        println!();
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("Agent error: {}", e);
+                    }
+                    Err(e) => {
+                        eprintln!("Communication error: {}", e);
+                    }
+                }
             }
             Err(rustyline::error::ReadlineError::Interrupted)
             | Err(rustyline::error::ReadlineError::Eof) => {

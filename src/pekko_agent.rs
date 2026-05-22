@@ -248,6 +248,45 @@ impl Actor for GseaPekkoAgent {
                 }
             }
 
+            AgentMessage::QueryWithReply(query, reply_tx) => {
+                info!(
+                    agent_id = %self.id,
+                    actor    = %ctx.name(),
+                    session  = %query.session_id,
+                    "Received QueryWithReply"
+                );
+
+                let correlation_id = query.session_id;
+                self.set_state(AgentState::Reasoning {
+                    query: query.content.clone(),
+                    iteration: 1,
+                    thought_chain: vec![],
+                });
+                self.emit_state_event(correlation_id).await;
+
+                match self.run_inner(&query.content).await {
+                    Ok(reply) => {
+                        info!(
+                            agent_id = %self.id,
+                            chars    = reply.len(),
+                            "QueryWithReply processed successfully"
+                        );
+                        self.set_state(AgentState::Idle);
+                        self.emit_state_event(correlation_id).await;
+                        let _ = reply_tx.send(Ok(reply));
+                    }
+                    Err(e) => {
+                        error!(agent_id = %self.id, error = %e, "Error processing query");
+                        self.set_state(AgentState::Error {
+                            error: e.to_string(),
+                            recoverable: true,
+                        });
+                        self.emit_state_event(correlation_id).await;
+                        let _ = reply_tx.send(Err(e.to_string()));
+                    }
+                }
+            }
+
             AgentMessage::Execute(action) => {
                 info!(
                     agent_id = %self.id,
