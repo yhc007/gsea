@@ -11,6 +11,7 @@ mod memory_system;
 mod pekko_agent;
 mod tools;
 
+use std::io::IsTerminal;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -168,7 +169,7 @@ async fn main() -> Result<()> {
         run_one_shot(&mut agent, &mut evolution, &prompt).await?;
     } else {
         // Read from stdin if available, otherwise show help
-        if atty::is(atty::Stream::Stdin) {
+        if std::io::stdin().is_terminal() {
             println!("GSEA — Gemma Self-Evolving Agent");
             println!("Usage: gsea [OPTIONS] <PROMPT>");
             println!("       gsea --interactive");
