@@ -7,6 +7,7 @@ mod gui;
 mod llm;
 mod mcp_server;
 mod memory_brain;
+mod pekko_agent;
 mod tools;
 
 use std::sync::Arc;
@@ -21,6 +22,9 @@ use llm::{
     OllamaClient,
 };
 use memory_brain::Brain;
+use pekko_agent::GseaPekkoAgent;
+use pekko_actor::ActorSystem;
+use pekko_agent_core::{AgentMessage, UserQuery};
 use tools::{
     file_tools,
     memory_tools,
@@ -147,6 +151,8 @@ async fn main() -> Result<()> {
     // Run mode
     if first_arg == Some("gui") {
         run_gui(agent, brain, registry, &cli.model).await?;
+    } else if first_arg == Some("pekko") {
+        run_pekko(agent).await?;
     } else if cli.interactive {
         let session_path = cli.session_out.clone();
         run_interactive(&mut agent, &mut evolution).await?;
@@ -344,6 +350,82 @@ async fn run_interactive(
                 println!();
 
                 evolution.after_episode(agent).await?;
+            }
+            Err(rustyline::error::ReadlineError::Interrupted)
+            | Err(rustyline::error::ReadlineError::Eof) => {
+                break;
+            }
+            Err(e) => {
+                eprintln!("Input error: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ─── Pekko Actor Mode ──────────────────────────────────────────────────────
+
+/// Start an `ActorSystem`, spawn a `GseaPekkoAgent`, and run an interactive
+/// REPL that sends `AgentMessage::Query` messages via the actor mailbox.
+///
+/// Responses are delivered asynchronously through the actor's `receive` loop
+/// and appear in the tracing log output.  This is fire-and-forget for now;
+/// a request-response channel can be wired in a later task.
+async fn run_pekko(agent: Agent) -> Result<()> {
+    println!("GSEA Pekko Mode — ActorSystem starting…");
+    println!("  Responses are printed via tracing (look for INFO lines)");
+    println!("  Type 'exit' or 'quit' to stop");
+    println!("{}", "─".repeat(50));
+
+    // Boot the ActorSystem.
+    let system = ActorSystem::new("gsea");
+
+    // Wrap the GSEA Agent in a GseaPekkoAgent actor.
+    let pekko_agent = GseaPekkoAgent::new("gsea-main", agent);
+
+    // Spawn into the system; returns a fire-and-forget ActorRef.
+    let actor_ref = system.spawn(pekko_agent, "gsea-main").await?;
+    tracing::info!(actor = %actor_ref.name(), "GseaPekkoAgent spawned");
+
+    // REPL loop.
+    let mut rl = rustyline::DefaultEditor::new()?;
+    loop {
+        let readline = rl.readline("pekko>> ");
+        match readline {
+            Ok(line) => {
+                let line = line.trim().to_string();
+                match line.as_str() {
+                    "" => continue,
+                    "exit" | "quit" => {
+                        println!("Goodbye!");
+                        break;
+                    }
+                    _ => {}
+                }
+
+                rl.add_history_entry(&line)?;
+
+                // Build a minimal UserQuery from the input text.
+                let query = UserQuery {
+                    session_id: uuid::Uuid::new_v4(),
+                    content: line.clone(),
+                    context: pekko_agent_core::ConversationContext {
+                        messages: vec![],
+                        metadata: std::collections::HashMap::new(),
+                    },
+                    auth: pekko_agent_core::AuthContext {
+                        user_id: "repl".to_string(),
+                        tenant_id: "local".to_string(),
+                        roles: vec!["user".to_string()],
+                    },
+                };
+
+                // Fire-and-forget: the actor processes the message and logs
+                // the response via tracing.
+                actor_ref.tell(AgentMessage::Query(query)).await?;
+                println!("(message sent — watch tracing output for the response)");
             }
             Err(rustyline::error::ReadlineError::Interrupted)
             | Err(rustyline::error::ReadlineError::Eof) => {
