@@ -184,6 +184,15 @@ When you're done, provide a final response to the user."#,
         false
     }
 
+    /// Override the system prompt (used for specialized agent roles).
+    pub fn set_system_prompt(&mut self, prompt: &str) {
+        if let Some(first) = self.messages.first_mut() {
+            if first.role == "system" {
+                first.content = prompt.to_string();
+            }
+        }
+    }
+
     /// Get a reference to the main LLM client (for GUI model switching).
     pub fn llm(&mut self) -> &mut OllamaClient {
         &mut self.llm

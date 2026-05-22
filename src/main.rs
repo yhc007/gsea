@@ -25,8 +25,9 @@ use llm::{
 };
 use memory_brain::Brain;
 use pekko_agent::GseaPekkoAgent;
-use pekko_actor::ActorSystem;
-use pekko_agent_core::{AgentMessage, UserQuery};
+use pekko_actor::{ActorRef, ActorSystem};
+use pekko_agent_core::{AgentInfo, AgentMessage, AgentStatus, AgentTask, TaskPriority, UserQuery};
+use pekko_agent_orchestrator::{OrchestratorActor, OrchestratorMessage};
 use tools::{
     file_tools,
     memory_tools,
@@ -122,7 +123,9 @@ async fn main() -> Result<()> {
         return run_review(&llm, &rev).await;
     }
     if first_arg == Some("serve-mcp") || first_arg == Some("server-mcp") {
-        return mcp_server::run_mcp_server(registry, brain).await;
+        // Create LLM client for MCP query tool
+        let mcp_llm = OllamaClient::new(&cli.ollama_url, &cli.model);
+        return mcp_server::run_mcp_server(registry, brain, None, Some(mcp_llm)).await;
     }
     // Initialize embedding engine
     let embedder: Arc<dyn EmbeddingEngine> = Arc::new(OllamaEmbedder::new(
@@ -386,30 +389,142 @@ async fn run_interactive(
 
 // ─── Pekko Actor Mode ──────────────────────────────────────────────────────
 
-/// Start an `ActorSystem`, spawn a `GseaPekkoAgent`, and run an interactive
-/// REPL that sends `AgentMessage::QueryWithReply` via the ask() pattern.
+/// Role-specific system prompts for specialized agents.
+fn role_system_prompt(role: &str) -> &'static str {
+    match role {
+        "coder" => "\
+You are GSEA-Coder, a specialized Rust code writer within the GSEA multi-agent system.\n\
+Your job is to write clean, idiomatic, well-tested Rust code.\n\
+Focus on: implementation, code generation, refactoring, and writing tests.\n\
+Always follow Rust best practices: error handling with Result/anyhow, proper lifetimes, no unwrap in production code.\n\
+When given a task, produce complete, compilable code. Use the available tools (read_file, write_file, cargo_build, cargo_test).",
+
+        "reviewer" => "\
+You are GSEA-Reviewer, a specialized code review agent within the GSEA multi-agent system.\n\
+Your job is to review code for correctness, safety, performance, and idiomatic Rust style.\n\
+Focus on: finding bugs, unsafe patterns, missing error handling, performance issues, and style problems.\n\
+Be specific and actionable in your feedback. Reference exact lines and suggest concrete fixes.\n\
+Use available tools (read_file, run_shell with 'git diff') to examine code.",
+
+        "tester" => "\
+You are GSEA-Tester, a specialized testing agent within the GSEA multi-agent system.\n\
+Your job is to write comprehensive tests, run test suites, and verify code correctness.\n\
+Focus on: unit tests, integration tests, edge cases, error paths, and property-based testing.\n\
+Use cargo_test to run tests and verify they pass. Report test coverage and any failures clearly.",
+
+        _ => "\
+You are GSEA — a self-evolving Rust engineering agent powered by a local LLM.\n\
+You have access to a MemoryBrain that stores your experiences, learnings, and skills.\n\
+Your ultimate goal is to improve your own capabilities over time.",
+    }
+}
+
+/// Start an `ActorSystem` with multiple specialized agents and an orchestrator.
 ///
-/// Responses are returned synchronously to the REPL through a oneshot channel.
+/// Spawns: gsea-main (coordinator), gsea-coder, gsea-reviewer, gsea-tester
+/// Plus an OrchestratorActor for task management.
 ///
 /// Extra REPL commands:
-///   `/memory <text>` — store `<text>` as a CLS episodic memory
-///   `/dream`         — run one offline consolidation pass
+///   `/agents`              — list registered agents and their status
+///   `/delegate <agent> <task>` — delegate a task to a specific agent
+///   `/memory <text>`       — store `<text>` as a CLS episodic memory
+///   `/dream`               — run one offline consolidation pass
 async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> {
-    println!("GSEA Pekko Mode — ActorSystem starting…");
+    println!("GSEA Pekko Mode — Multi-Agent ActorSystem starting…");
     println!("  Type 'exit' or 'quit' to stop");
-    println!("  /memory <text>  — store a CLS memory");
-    println!("  /dream          — run dream consolidation");
+    println!("  /agents             — list agents");
+    println!("  /delegate <agent> <task> — delegate to agent");
+    println!("  /memory <text>      — store a CLS memory");
+    println!("  /dream              — run dream consolidation");
     println!("{}", "─".repeat(50));
 
     // Boot the ActorSystem.
     let system = ActorSystem::new("gsea");
 
-    // Wrap the GSEA Agent in a GseaPekkoAgent actor.
-    let pekko_agent = GseaPekkoAgent::new("gsea-main", agent);
+    // ─── Spawn the Orchestrator ─────────────────────────────────
+    let orchestrator = OrchestratorActor::new();
+    let orch_ref = system.spawn(orchestrator, "orchestrator").await?;
+    tracing::info!("OrchestratorActor spawned");
 
-    // Spawn into the system; returns an ActorRef supporting tell() and ask().
-    let actor_ref = system.spawn(pekko_agent, "gsea-main").await?;
-    tracing::info!(actor = %actor_ref.name(), "GseaPekkoAgent spawned");
+    // ─── Spawn the main agent ───────────────────────────────────
+    let main_agent = GseaPekkoAgent::new("gsea-main", agent);
+    let main_ref = system.spawn(main_agent, "gsea-main").await?;
+    tracing::info!(actor = %main_ref.name(), "Main agent spawned");
+
+    // Register main agent with orchestrator
+    orch_ref.tell(OrchestratorMessage::RegisterAgent(AgentInfo {
+        agent_id: "gsea-main".to_string(),
+        agent_type: "coordinator".to_string(),
+        description: "Main GSEA coordinator agent".to_string(),
+        capabilities: vec!["reasoning".into(), "tools".into(), "memory".into()],
+        status: AgentStatus::Available,
+    })).await?;
+
+    // ─── Spawn specialized agents ───────────────────────────────
+    // Each specialized agent shares the same Brain and ToolRegistry but
+    // has a role-specific system prompt.
+    let brain_ref = evolution.brain.clone();
+    let registry_ref = {
+        // Get registry from the main agent's tools
+        // We need to create new Agent instances for each role
+        let b = brain_ref.clone();
+        let reg = Arc::new(std::sync::Mutex::new(ToolRegistry::new()));
+        {
+            let mut r = reg.lock().unwrap();
+            r.register(Box::new(file_tools::ReadFile));
+            r.register(Box::new(file_tools::WriteFile));
+            r.register(Box::new(file_tools::RunShell));
+            r.register(Box::new(file_tools::CargoBuild));
+            r.register(Box::new(file_tools::CargoTest));
+            r.register(Box::new(file_tools::GitCommit));
+            r.register(Box::new(memory_tools::MemoryStore::new(b.clone())));
+            r.register(Box::new(memory_tools::MemoryRecall::new(b.clone())));
+            r.register(Box::new(memory_tools::MemoryStats::new(b.clone())));
+            r.register(Box::new(memory_tools::Reflect::new(b.clone())));
+            r.register(Box::new(skill_tools::CallSkill::new(b)));
+        }
+        reg
+    };
+
+    // Store agent refs for delegation
+    let mut agent_refs: std::collections::HashMap<String, ActorRef<AgentMessage>> = std::collections::HashMap::new();
+    agent_refs.insert("gsea-main".to_string(), main_ref.clone());
+
+    let roles = [("gsea-coder", "coder"), ("gsea-reviewer", "reviewer"), ("gsea-tester", "tester")];
+    let cli = Cli::parse();
+
+    for (agent_id, role) in &roles {
+        let llm = OllamaClient::new(&cli.ollama_url, &cli.model);
+        let fast_llm = OllamaClient::new(&cli.ollama_url, &cli.fast_model);
+        let embedder: Arc<dyn llm::embedding::EmbeddingEngine> = Arc::new(
+            llm::embedding::OllamaEmbedder::new(&cli.ollama_url, &cli.embed_model)
+        );
+        let mut role_agent = Agent::new(
+            llm, fast_llm, brain_ref.clone(), registry_ref.clone(), embedder,
+        );
+        role_agent.set_system_prompt(role_system_prompt(role));
+
+        let pekko_agent = GseaPekkoAgent::new_with_role(agent_id, role, role_agent);
+        let actor_ref = system.spawn(pekko_agent, agent_id).await?;
+        tracing::info!(actor = %actor_ref.name(), role = %role, "Specialized agent spawned");
+
+        orch_ref.tell(OrchestratorMessage::RegisterAgent(AgentInfo {
+            agent_id: agent_id.to_string(),
+            agent_type: role.to_string(),
+            description: format!("GSEA {} agent", role),
+            capabilities: match *role {
+                "coder" => vec!["code_generation".into(), "refactoring".into(), "testing".into()],
+                "reviewer" => vec!["code_review".into(), "analysis".into()],
+                "tester" => vec!["testing".into(), "verification".into()],
+                _ => vec![],
+            },
+            status: AgentStatus::Available,
+        })).await?;
+
+        agent_refs.insert(agent_id.to_string(), actor_ref);
+    }
+
+    println!("Agents online: gsea-main, gsea-coder, gsea-reviewer, gsea-tester");
 
     // Boot the CLS MemorySystem and print initial stats.
     let mut mem = memory_system::MemorySystem::new();
@@ -435,6 +550,20 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                         println!("Goodbye!");
                         break;
                     }
+                    "/agents" => {
+                        println!("Registered agents:");
+                        for (id, _) in &agent_refs {
+                            let role = match id.as_str() {
+                                "gsea-main" => "coordinator",
+                                "gsea-coder" => "coder",
+                                "gsea-reviewer" => "reviewer",
+                                "gsea-tester" => "tester",
+                                _ => "unknown",
+                            };
+                            println!("  {} [{}]", id, role);
+                        }
+                        continue;
+                    }
                     "/dream" => {
                         println!("Running dream consolidation…");
                         mem.dream();
@@ -445,6 +574,64 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                             s.total_concepts,
                             s.dream_last_run
                         );
+                        continue;
+                    }
+                    cmd if cmd.starts_with("/delegate ") => {
+                        let rest = cmd.trim_start_matches("/delegate ").trim();
+                        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                        if parts.len() < 2 {
+                            println!("Usage: /delegate <agent-id> <task description>");
+                            println!("  Agents: gsea-coder, gsea-reviewer, gsea-tester");
+                            continue;
+                        }
+                        let target = parts[0];
+                        let task_desc = parts[1];
+
+                        if let Some(target_ref) = agent_refs.get(target) {
+                            println!("Delegating to {}…", target);
+
+                            // Submit task to orchestrator for tracking
+                            let task_id = uuid::Uuid::new_v4();
+                            orch_ref.tell(OrchestratorMessage::SubmitTask(AgentTask {
+                                task_id,
+                                description: task_desc.to_string(),
+                                input: serde_json::json!({ "prompt": task_desc }),
+                                priority: TaskPriority::Normal,
+                                timeout_ms: 120_000,
+                            })).await?;
+
+                            // Send directly to target agent via ask()
+                            let query = make_query(task_desc);
+                            let response = target_ref.ask(
+                                |reply_tx| AgentMessage::QueryWithReply(query, reply_tx),
+                                std::time::Duration::from_secs(120),
+                            ).await;
+
+                            match response {
+                                Ok(Ok(text)) => {
+                                    println!("\n[{}] {}", target, text);
+                                    println!();
+                                    // Mark task complete
+                                    orch_ref.tell(OrchestratorMessage::CompleteTask {
+                                        task_id,
+                                        result: serde_json::json!({ "response": &text[..text.len().min(500)] }),
+                                    }).await?;
+                                }
+                                Ok(Err(e)) => {
+                                    eprintln!("[{}] Error: {}", target, e);
+                                    orch_ref.tell(OrchestratorMessage::FailTask {
+                                        task_id,
+                                        error: e.clone(),
+                                    }).await?;
+                                }
+                                Err(e) => {
+                                    eprintln!("[{}] Communication error: {}", target, e);
+                                }
+                            }
+                        } else {
+                            println!("Unknown agent: {}", target);
+                            println!("Available: {}", agent_refs.keys().cloned().collect::<Vec<_>>().join(", "));
+                        }
                         continue;
                     }
                     cmd if cmd.starts_with("/memory ") => {
@@ -464,23 +651,9 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
 
                 rl.add_history_entry(&line)?;
 
-                // Build a minimal UserQuery from the input text.
-                let query = UserQuery {
-                    session_id: uuid::Uuid::new_v4(),
-                    content: line.clone(),
-                    context: pekko_agent_core::ConversationContext {
-                        messages: vec![],
-                        metadata: std::collections::HashMap::new(),
-                    },
-                    auth: pekko_agent_core::AuthContext {
-                        user_id: "repl".to_string(),
-                        tenant_id: "local".to_string(),
-                        roles: vec!["user".to_string()],
-                    },
-                };
-
-                // Request-response via the ask() pattern.
-                let response = actor_ref.ask(
+                // Default: send to main agent via ask()
+                let query = make_query(&line);
+                let response = main_ref.ask(
                     |reply_tx| AgentMessage::QueryWithReply(query, reply_tx),
                     std::time::Duration::from_secs(120),
                 ).await;
@@ -515,4 +688,21 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// Build a `UserQuery` from raw input text.
+fn make_query(input: &str) -> UserQuery {
+    UserQuery {
+        session_id: uuid::Uuid::new_v4(),
+        content: input.to_string(),
+        context: pekko_agent_core::ConversationContext {
+            messages: vec![],
+            metadata: std::collections::HashMap::new(),
+        },
+        auth: pekko_agent_core::AuthContext {
+            user_id: "repl".to_string(),
+            tenant_id: "local".to_string(),
+            roles: vec!["user".to_string()],
+        },
+    }
 }

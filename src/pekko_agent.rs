@@ -46,6 +46,9 @@ pub struct GseaPekkoAgent {
     /// Unique actor/agent identifier (e.g. `"gsea-main"`).
     pub id: String,
 
+    /// Role of this agent (e.g. "main", "coder", "reviewer", "tester").
+    pub role: String,
+
     /// Current FSM state.
     pub state: AgentState,
 
@@ -71,6 +74,11 @@ impl GseaPekkoAgent {
     /// Create a new `GseaPekkoAgent`, snapshotting `ToolDefinition`s from the
     /// inner `Agent`'s `ToolRegistry`.
     pub fn new(id: &str, agent: Agent) -> Self {
+        Self::new_with_role(id, "main", agent)
+    }
+
+    /// Create a new `GseaPekkoAgent` with a specific role.
+    pub fn new_with_role(id: &str, role: &str, agent: Agent) -> Self {
         // Snapshot tool definitions from the registry.
         let tool_defs: Vec<ToolDefinition> = {
             let registry = agent.tools.lock().expect("tool registry lock poisoned");
@@ -90,6 +98,7 @@ impl GseaPekkoAgent {
 
         Self {
             id: id.to_string(),
+            role: role.to_string(),
             state: AgentState::Idle,
             agent: Arc::new(Mutex::new(Some(agent))),
             tool_defs,
@@ -546,6 +555,7 @@ mod tests {
     fn make_stub(id: &str) -> GseaPekkoAgent {
         GseaPekkoAgent {
             id: id.to_string(),
+            role: "main".to_string(),
             state: AgentState::Idle,
             agent: Arc::new(Mutex::new(None)), // intentionally empty
             tool_defs: vec![],
