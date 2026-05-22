@@ -414,8 +414,17 @@ Use cargo_test to run tests and verify they pass. Report test coverage and any f
 
         _ => "\
 You are GSEA — a self-evolving Rust engineering agent powered by a local LLM.\n\
-You have access to a MemoryBrain that stores your experiences, learnings, and skills.\n\
-Your ultimate goal is to improve your own capabilities over time.",
+You are the coordinator in a multi-agent system with specialized agents:\n\
+  - gsea-coder: writes Rust code, implements features\n\
+  - gsea-reviewer: reviews code for bugs, safety, style\n\
+  - gsea-tester: writes and runs tests\n\n\
+When a task is better handled by a specialist, delegate using this format:\n\
+@delegate(agent-id, task description)\n\
+Examples:\n\
+  @delegate(gsea-coder, implement a retry utility with exponential backoff)\n\
+  @delegate(gsea-reviewer, review the retry utility in src/retry.rs)\n\
+  @delegate(gsea-tester, write tests for the retry module)\n\n\
+Only delegate when the task clearly fits a specialist. For general questions, answer directly.",
     }
 }
 
@@ -672,8 +681,34 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
 
                 match response {
                     Ok(Ok(text)) => {
-                        println!("\n{}", text);
-                        println!();
+                        // Check for auto-delegation in the response
+                        if let Some((target, task)) = parse_delegation(&text) {
+                            if let Some(target_ref) = agent_refs.get(&target) {
+                                println!("\n[main → {}] Auto-delegating: {}", target, task);
+
+                                let del_query = make_query(&task);
+                                let del_response = target_ref.ask(
+                                    |reply_tx| AgentMessage::QueryWithReply(del_query, reply_tx),
+                                    std::time::Duration::from_secs(120),
+                                ).await;
+
+                                match del_response {
+                                    Ok(Ok(del_text)) => {
+                                        println!("\n[{}] {}", target, del_text);
+                                        println!();
+                                    }
+                                    Ok(Err(e)) => eprintln!("[{}] Error: {}", target, e),
+                                    Err(e) => eprintln!("[{}] Communication error: {}", target, e),
+                                }
+                            } else {
+                                // Unknown agent, print the original response
+                                println!("\n{}", text);
+                                println!();
+                            }
+                        } else {
+                            println!("\n{}", text);
+                            println!();
+                        }
                     }
                     Ok(Err(e)) => {
                         eprintln!("Agent error: {}", e);
@@ -700,6 +735,28 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// Parse a delegation directive from the main agent's response.
+///
+/// Looks for `@delegate(agent-id, task description)` anywhere in the text.
+/// Returns `Some((agent_id, task))` if found, `None` otherwise.
+fn parse_delegation(text: &str) -> Option<(String, String)> {
+    let marker = "@delegate(";
+    let start = text.find(marker)?;
+    let rest = &text[start + marker.len()..];
+    let end = rest.find(')')?;
+    let inner = &rest[..end];
+
+    let comma = inner.find(',')?;
+    let agent_id = inner[..comma].trim().to_string();
+    let task = inner[comma + 1..].trim().to_string();
+
+    if agent_id.is_empty() || task.is_empty() {
+        return None;
+    }
+
+    Some((agent_id, task))
 }
 
 /// Build a `UserQuery` from raw input text.

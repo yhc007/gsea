@@ -193,6 +193,12 @@ When you're done, provide a final response to the user."#,
         }
     }
 
+    /// Check whether an error is a circuit breaker error (open or timeout).
+    fn is_circuit_error(e: &anyhow::Error) -> bool {
+        let msg = e.to_string();
+        msg.starts_with("circuit_open:") || msg.starts_with("circuit_timeout:")
+    }
+
     /// Get a reference to the main LLM client (for GUI model switching).
     pub fn llm(&mut self) -> &mut OllamaClient {
         &mut self.llm
@@ -267,10 +273,20 @@ When you're done, provide a final response to the user."#,
             content: augmented_input,
         });
 
-        // 3. Stream the LLM response
+        // 3. Stream the LLM response (with circuit breaker fallback)
         let use_main = Self::needs_complex_model(user_input);
-        let llm = if use_main { &self.llm } else { &self.fast_llm };
-        let mut stream_rx = llm.chat_stream(self.messages.clone()).await?;
+        let mut stream_rx = if use_main {
+            match self.llm.chat_stream(self.messages.clone()).await {
+                Ok(rx) => rx,
+                Err(e) if Self::is_circuit_error(&e) => {
+                    tracing::warn!("Main model circuit open for stream, falling back: {}", e);
+                    self.fast_llm.chat_stream(self.messages.clone()).await?
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            self.fast_llm.chat_stream(self.messages.clone()).await?
+        };
 
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         let messages = self.messages.clone();
@@ -392,14 +408,21 @@ When you're done, provide a final response to the user."#,
             content: augmented_input,
         });
 
-        // 3. Send to appropriate model and get response
+        // 3. Send to appropriate model and get response (with circuit breaker fallback)
         let tool_specs = self.tools.lock().unwrap().tool_specs();
         let use_main = Self::needs_complex_model(user_input);
         let response = if use_main {
-            tracing::debug!("Using main model (gemma4:26b) for: {:.60}", user_input);
-            self.llm.chat_with_tools(self.messages.clone(), tool_specs).await?
+            tracing::debug!("Using main model ({}) for: {:.60}", self.llm.model_name(), user_input);
+            match self.llm.chat_with_tools(self.messages.clone(), tool_specs.clone()).await {
+                Ok(resp) => resp,
+                Err(e) if Self::is_circuit_error(&e) => {
+                    tracing::warn!("Main model circuit open, falling back to fast model: {}", e);
+                    self.fast_llm.chat_with_tools(self.messages.clone(), tool_specs).await?
+                }
+                Err(e) => return Err(e),
+            }
         } else {
-            tracing::info!("Using fast model (qwen3:8b) for: {:.60}", user_input);
+            tracing::info!("Using fast model ({}) for: {:.60}", self.fast_llm.model_name(), user_input);
             self.fast_llm.chat_with_tools(self.messages.clone(), tool_specs).await?
         };
 
