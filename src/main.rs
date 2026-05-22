@@ -27,7 +27,7 @@ use memory_brain::Brain;
 use pekko_agent::GseaPekkoAgent;
 use pekko_actor::{ActorRef, ActorSystem};
 use pekko_agent_core::{AgentInfo, AgentMessage, AgentStatus, AgentTask, TaskPriority, UserQuery};
-use pekko_agent_orchestrator::{OrchestratorActor, OrchestratorMessage};
+use pekko_agent_orchestrator::{OrchestratorActor, OrchestratorMessage, Workflow, WorkflowStep};
 use tools::{
     file_tools,
     memory_tools,
@@ -432,10 +432,11 @@ Your ultimate goal is to improve your own capabilities over time.",
 async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> {
     println!("GSEA Pekko Mode — Multi-Agent ActorSystem starting…");
     println!("  Type 'exit' or 'quit' to stop");
-    println!("  /agents             — list agents");
+    println!("  /agents                  — list agents");
     println!("  /delegate <agent> <task> — delegate to agent");
-    println!("  /memory <text>      — store a CLS memory");
-    println!("  /dream              — run dream consolidation");
+    println!("  /workflow <task>         — run coder→reviewer→tester pipeline");
+    println!("  /memory <text>           — store a CLS memory");
+    println!("  /dream                   — run dream consolidation");
     println!("{}", "─".repeat(50));
 
     // Boot the ActorSystem.
@@ -634,6 +635,17 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                         }
                         continue;
                     }
+                    cmd if cmd.starts_with("/workflow ") => {
+                        let task_desc = cmd.trim_start_matches("/workflow ").trim();
+                        if task_desc.is_empty() {
+                            println!("Usage: /workflow <task description>");
+                            println!("  Runs: coder → reviewer → tester pipeline");
+                            continue;
+                        }
+
+                        run_workflow(task_desc, &agent_refs, &orch_ref).await?;
+                        continue;
+                    }
                     cmd if cmd.starts_with("/memory ") => {
                         let content = cmd.trim_start_matches("/memory ").trim();
                         if content.is_empty() {
@@ -705,4 +717,189 @@ fn make_query(input: &str) -> UserQuery {
             roles: vec!["user".to_string()],
         },
     }
+}
+
+/// Execute a coder → reviewer → tester workflow pipeline.
+///
+/// 1. **Coder** receives the task and produces code/implementation
+/// 2. **Reviewer** receives the coder's output and reviews it
+/// 3. **Tester** receives both outputs and writes/runs tests
+///
+/// Each step's output is passed as context to the next step.
+/// The workflow is tracked via the OrchestratorActor.
+async fn run_workflow(
+    task_desc: &str,
+    agent_refs: &std::collections::HashMap<String, ActorRef<AgentMessage>>,
+    orch_ref: &ActorRef<OrchestratorMessage>,
+) -> Result<()> {
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Workflow: coder → reviewer → tester");
+    println!("Task: {}", task_desc);
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    // Build workflow definition for orchestrator tracking
+    let mut workflow = Workflow::new(
+        format!("pipeline: {}", &task_desc[..task_desc.len().min(40)]),
+        task_desc.to_string(),
+    );
+    workflow.add_step(WorkflowStep {
+        step_id: "code".into(),
+        agent_type: "coder".into(),
+        action: "implement".into(),
+        input_mapping: std::collections::HashMap::new(),
+        output_key: "code_output".into(),
+        depends_on: vec![],
+        timeout_ms: 120_000,
+    });
+    workflow.add_step(WorkflowStep {
+        step_id: "review".into(),
+        agent_type: "reviewer".into(),
+        action: "review".into(),
+        input_mapping: [("code".into(), "code_output".into())].into_iter().collect(),
+        output_key: "review_output".into(),
+        depends_on: vec!["code".into()],
+        timeout_ms: 120_000,
+    });
+    workflow.add_step(WorkflowStep {
+        step_id: "test".into(),
+        agent_type: "tester".into(),
+        action: "test".into(),
+        input_mapping: [("code".into(), "code_output".into()), ("review".into(), "review_output".into())].into_iter().collect(),
+        output_key: "test_output".into(),
+        depends_on: vec!["code".into(), "review".into()],
+        timeout_ms: 120_000,
+    });
+
+    let workflow_id = workflow.id;
+    orch_ref.tell(OrchestratorMessage::CreateWorkflow(workflow)).await?;
+
+    // Pipeline steps: (agent_id, step_label, prompt_builder)
+    let steps: Vec<(&str, &str)> = vec![
+        ("gsea-coder", "Step 1/3: Coder"),
+        ("gsea-reviewer", "Step 2/3: Reviewer"),
+        ("gsea-tester", "Step 3/3: Tester"),
+    ];
+
+    let mut step_outputs: Vec<String> = Vec::new();
+    let mut failed = false;
+
+    for (i, (agent_id, label)) in steps.iter().enumerate() {
+        println!("\n── {} ──────────────────────────────────", label);
+
+        let agent_ref = match agent_refs.get(*agent_id) {
+            Some(r) => r,
+            None => {
+                eprintln!("Agent {} not found, aborting workflow", agent_id);
+                failed = true;
+                break;
+            }
+        };
+
+        // Build the prompt with context from previous steps
+        let prompt = match i {
+            0 => {
+                // Coder: just the task
+                format!(
+                    "Task: {}\n\n\
+                     Write the implementation for this task. \
+                     Produce complete, compilable Rust code. \
+                     Explain your approach briefly, then show the code.",
+                    task_desc
+                )
+            }
+            1 => {
+                // Reviewer: task + coder output
+                format!(
+                    "Original task: {}\n\n\
+                     --- Coder's output ---\n{}\n\
+                     --- End of coder's output ---\n\n\
+                     Review the code above for:\n\
+                     1. Correctness and potential bugs\n\
+                     2. Safety issues (unwrap, unsafe, panics)\n\
+                     3. Performance concerns\n\
+                     4. Idiomatic Rust style\n\
+                     Be specific and actionable.",
+                    task_desc, step_outputs[0]
+                )
+            }
+            2 => {
+                // Tester: task + coder output + reviewer feedback
+                format!(
+                    "Original task: {}\n\n\
+                     --- Coder's output ---\n{}\n\
+                     --- Reviewer's feedback ---\n{}\n\
+                     --- End ---\n\n\
+                     Write comprehensive tests for the implementation above.\n\
+                     Cover: happy path, edge cases, error paths.\n\
+                     Show the test code and describe what each test verifies.",
+                    task_desc, step_outputs[0], step_outputs[1]
+                )
+            }
+            _ => unreachable!(),
+        };
+
+        // Submit task to orchestrator
+        let task_id = uuid::Uuid::new_v4();
+        orch_ref.tell(OrchestratorMessage::SubmitTask(AgentTask {
+            task_id,
+            description: format!("{}: {}", label, &task_desc[..task_desc.len().min(60)]),
+            input: serde_json::json!({ "prompt": &prompt[..prompt.len().min(200)] }),
+            priority: TaskPriority::Normal,
+            timeout_ms: 120_000,
+        })).await?;
+
+        // Send to agent via ask()
+        let query = make_query(&prompt);
+        let response = agent_ref.ask(
+            |reply_tx| AgentMessage::QueryWithReply(query, reply_tx),
+            std::time::Duration::from_secs(120),
+        ).await;
+
+        match response {
+            Ok(Ok(text)) => {
+                // Truncate display but keep full text for context passing
+                let display: String = text.chars().take(2000).collect();
+                println!("{}", display);
+                if text.len() > 2000 {
+                    println!("... ({} chars total)", text.len());
+                }
+                step_outputs.push(text);
+
+                orch_ref.tell(OrchestratorMessage::CompleteTask {
+                    task_id,
+                    result: serde_json::json!({ "status": "ok" }),
+                }).await?;
+            }
+            Ok(Err(e)) => {
+                eprintln!("[{}] Error: {}", agent_id, e);
+                orch_ref.tell(OrchestratorMessage::FailTask {
+                    task_id,
+                    error: e,
+                }).await?;
+                failed = true;
+                break;
+            }
+            Err(e) => {
+                eprintln!("[{}] Communication error: {}", agent_id, e);
+                failed = true;
+                break;
+            }
+        }
+    }
+
+    // Summary
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    if failed {
+        println!("Workflow FAILED (completed {}/{} steps)", step_outputs.len(), steps.len());
+        println!("Workflow ID: {}", workflow_id);
+    } else {
+        println!("Workflow COMPLETED ({}/{} steps)", step_outputs.len(), steps.len());
+        println!("Workflow ID: {}", workflow_id);
+        println!("  coder:    {} chars", step_outputs.get(0).map(|s| s.len()).unwrap_or(0));
+        println!("  reviewer: {} chars", step_outputs.get(1).map(|s| s.len()).unwrap_or(0));
+        println!("  tester:   {} chars", step_outputs.get(2).map(|s| s.len()).unwrap_or(0));
+    }
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    Ok(())
 }
