@@ -26,4 +26,11 @@ rustyline = "14"
 atty = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 eframe = "0.31"
-futures = "0.3.32"
+
+# pekko-agent dependencies
+pekko-actor = { path = "../rust-pekko/pekko-actor" }
+pekko-agent-core = { path = "../pekko-agent/crates/pekko-agent-core" }
+pekko-agent-memory = { path = "../pekko-agent/crates/pekko-agent-memory" }
+pekko-agent-tools = { path = "../pekko-agent/crates/pekko-agent-tools" }
+pekko-agent-orchestrator = { path = "../pekko-agent/crates/pekko-agent-orchestrator" }
+pekko-agent-events = { path = "../pekko-agent/crates/pekko-agent-events" }
