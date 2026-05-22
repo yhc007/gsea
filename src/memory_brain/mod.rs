@@ -21,6 +21,7 @@ pub mod consolidate;
 pub mod forgetting;
 pub mod types;
 pub mod storage;
+pub mod pekko_adapter;
 
 pub use types::*;
 pub use working::WorkingMemory;
