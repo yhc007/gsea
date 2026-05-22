@@ -86,4 +86,66 @@ impl ProceduralMemory {
         }
         None
     }
+
+    // ─── Workflow Templates (typed procedural memories) ─────────
+
+    /// Store a workflow template definition.
+    ///
+    /// Format: `WORKFLOW:<name>|<description>|<steps_json>`
+    /// where steps_json is a JSON array of step definitions.
+    pub fn store_workflow_template(
+        &self,
+        name: &str,
+        description: &str,
+        steps_json: &str,
+    ) -> Result<()> {
+        // Remove existing template with same name (upsert)
+        let existing = self.storage.search(
+            &format!("WORKFLOW:{}|", name),
+            1,
+            MemoryType::Procedural,
+        );
+        for item in existing {
+            if item.content.starts_with(&format!("WORKFLOW:{}|", name)) {
+                let _ = self.storage.delete(&item.id.to_string());
+            }
+        }
+
+        let content = format!("WORKFLOW:{}|{}|{}", name, description, steps_json);
+        let item = MemoryItem::new(&content, MemoryType::Procedural)
+            .with_tags(vec!["workflow_template".to_string(), name.to_string()]);
+        self.storage.insert(item)?;
+        Ok(())
+    }
+
+    /// List all stored workflow templates as (name, description) pairs.
+    pub fn list_workflow_templates(&self) -> Vec<(String, String)> {
+        let results = self.storage.search("WORKFLOW:", 50, MemoryType::Procedural);
+        let mut templates = Vec::new();
+        for item in results {
+            if let Some(rest) = item.content.strip_prefix("WORKFLOW:") {
+                let parts: Vec<&str> = rest.splitn(3, '|').collect();
+                if parts.len() >= 2 {
+                    templates.push((parts[0].to_string(), parts[1].to_string()));
+                }
+            }
+        }
+        templates.dedup_by(|a, b| a.0 == b.0);
+        templates
+    }
+
+    /// Get a workflow template's step definitions as JSON string.
+    pub fn get_workflow_template(&self, name: &str) -> Option<(String, String)> {
+        let query = format!("WORKFLOW:{}|", name);
+        let results = self.storage.search(&query, 5, MemoryType::Procedural);
+        for item in results {
+            if let Some(rest) = item.content.strip_prefix("WORKFLOW:") {
+                let parts: Vec<&str> = rest.splitn(3, '|').collect();
+                if parts.len() == 3 && parts[0] == name {
+                    return Some((parts[1].to_string(), parts[2].to_string()));
+                }
+            }
+        }
+        None
+    }
 }

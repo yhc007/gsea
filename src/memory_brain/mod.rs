@@ -145,6 +145,67 @@ impl Brain {
         self.procedural.get_skill_code(name)
     }
 
+    // ─── Workflow Templates ─────────────────────────────────────
+
+    /// Store a workflow template in procedural memory.
+    pub fn store_workflow_template(
+        &self,
+        name: &str,
+        description: &str,
+        steps_json: &str,
+    ) -> Result<(), anyhow::Error> {
+        self.procedural.store_workflow_template(name, description, steps_json)?;
+        Ok(())
+    }
+
+    /// List all workflow templates as (name, description) pairs.
+    pub fn list_workflow_templates(&self) -> Vec<(String, String)> {
+        self.procedural.list_workflow_templates()
+    }
+
+    /// Get a workflow template by name. Returns (description, steps_json).
+    pub fn get_workflow_template(&self, name: &str) -> Option<(String, String)> {
+        self.procedural.get_workflow_template(name)
+    }
+
+    // ─── Agent Memory Sharing ─────────────────────────────────────
+
+    /// Store a workflow or delegation result as an episodic memory
+    /// tagged with agent role and task context, so it can be recalled
+    /// in future sessions.
+    pub fn store_agent_result(
+        &mut self,
+        agent_id: &str,
+        task: &str,
+        result: &str,
+        workflow_id: Option<&str>,
+    ) -> Result<UuidValue, anyhow::Error> {
+        let content = format!(
+            "AGENT_RESULT:{}|{}|{}\n{}",
+            agent_id,
+            workflow_id.unwrap_or("direct"),
+            task,
+            result,
+        );
+        let mut item = MemoryItem::new(&content, MemoryType::Episodic);
+        item.tags = vec![
+            "agent_result".to_string(),
+            agent_id.to_string(),
+        ];
+        if let Some(wid) = workflow_id {
+            item.tags.push(format!("workflow:{}", wid));
+        }
+        let id = item.id;
+        self.episodic.store(item)?;
+        Ok(id)
+    }
+
+    /// Recall previous agent results by searching episodic memory.
+    pub fn recall_agent_results(&self, query: &str, limit: usize) -> Vec<MemoryItem> {
+        let search_query = format!("AGENT_RESULT {}", query);
+        self.episodic.search(&search_query, limit)
+    }
+
     /// Learn: store a new piece of information as a semantic memory.
     /// Returns the memory ID for later reference.
     pub fn learn(&self, content: &str) -> Result<UuidValue, anyhow::Error> {

@@ -428,24 +428,74 @@ Only delegate when the task clearly fits a specialist. For general questions, an
     }
 }
 
+/// Register built-in workflow templates in the Brain if not already present.
+fn register_builtin_workflow_templates(brain: &Brain) {
+    let templates = vec![
+        (
+            "pr-review",
+            "Code review pipeline: coder implements → reviewer reviews → tester verifies",
+            r#"[
+                {"step_id":"code","agent":"gsea-coder","prompt_template":"Implement the following:\n\nTask: {task}"},
+                {"step_id":"review","agent":"gsea-reviewer","prompt_template":"Review the code below:\n\nOriginal task: {task}\n\n--- Coder's output ---\n{prev_output}\n--- End ---\n\nCheck for bugs, safety issues, performance, and style."},
+                {"step_id":"test","agent":"gsea-tester","prompt_template":"Write tests for the implementation:\n\nOriginal task: {task}\n\n--- Implementation ---\n{all_outputs}\n--- End ---\n\nCover happy path, edge cases, and error paths."}
+            ]"#,
+        ),
+        (
+            "refactor",
+            "Refactoring pipeline: reviewer analyzes → coder refactors → tester validates",
+            r#"[
+                {"step_id":"analyze","agent":"gsea-reviewer","prompt_template":"Analyze the following code for refactoring opportunities:\n\nTarget: {task}\n\nIdentify: code smells, duplication, complexity, naming issues. Be specific with line references."},
+                {"step_id":"refactor","agent":"gsea-coder","prompt_template":"Refactor based on this analysis:\n\nOriginal target: {task}\n\n--- Analysis ---\n{prev_output}\n--- End ---\n\nApply the suggested improvements. Show the refactored code."},
+                {"step_id":"verify","agent":"gsea-tester","prompt_template":"Verify the refactoring is correct:\n\nOriginal target: {task}\n\n--- Changes ---\n{all_outputs}\n--- End ---\n\nRun existing tests and write new ones if needed. Confirm behavior is preserved."}
+            ]"#,
+        ),
+        (
+            "bugfix",
+            "Bug fix pipeline: reviewer diagnoses → coder fixes → tester validates",
+            r#"[
+                {"step_id":"diagnose","agent":"gsea-reviewer","prompt_template":"Diagnose this bug:\n\nBug report: {task}\n\nAnalyze root cause, identify affected code, and suggest a fix approach."},
+                {"step_id":"fix","agent":"gsea-coder","prompt_template":"Fix this bug based on the diagnosis:\n\nBug report: {task}\n\n--- Diagnosis ---\n{prev_output}\n--- End ---\n\nImplement the fix. Show the changed code."},
+                {"step_id":"validate","agent":"gsea-tester","prompt_template":"Validate the bug fix:\n\nBug report: {task}\n\n--- Fix details ---\n{all_outputs}\n--- End ---\n\nWrite a regression test that reproduces the bug and confirms the fix works."}
+            ]"#,
+        ),
+    ];
+
+    for (name, description, steps_json) in templates {
+        // Only insert if not already stored
+        if brain.get_workflow_template(name).is_none() {
+            if let Err(e) = brain.store_workflow_template(name, description, steps_json) {
+                tracing::warn!("Failed to register template '{}': {}", name, e);
+            }
+        }
+    }
+}
+
 /// Start an `ActorSystem` with multiple specialized agents and an orchestrator.
 ///
 /// Spawns: gsea-main (coordinator), gsea-coder, gsea-reviewer, gsea-tester
 /// Plus an OrchestratorActor for task management.
 ///
 /// Extra REPL commands:
-///   `/agents`              — list registered agents and their status
-///   `/delegate <agent> <task>` — delegate a task to a specific agent
-///   `/memory <text>`       — store `<text>` as a CLS episodic memory
-///   `/dream`               — run one offline consolidation pass
+///   `/agents`                     — list registered agents and their status
+///   `/delegate <agent> <task>`    — delegate a task to a specific agent
+///   `/workflow <task>`            — run coder→reviewer→tester pipeline
+///   `/workflow list`              — list available workflow templates
+///   `/workflow run <name> <task>` — run a named workflow template
+///   `/workflow save <name> <desc> <json>` — save a custom workflow template
+///   `/history [query]`            — recall past agent results
+///   `/memory <text>`              — store `<text>` as a CLS episodic memory
+///   `/dream`                      — run one offline consolidation pass
 async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> {
     println!("GSEA Pekko Mode — Multi-Agent ActorSystem starting…");
     println!("  Type 'exit' or 'quit' to stop");
-    println!("  /agents                  — list agents");
-    println!("  /delegate <agent> <task> — delegate to agent");
-    println!("  /workflow <task>         — run coder→reviewer→tester pipeline");
-    println!("  /memory <text>           — store a CLS memory");
-    println!("  /dream                   — run dream consolidation");
+    println!("  /agents                      — list agents");
+    println!("  /delegate <agent> <task>     — delegate to agent");
+    println!("  /workflow <task>             — run coder→reviewer→tester pipeline");
+    println!("  /workflow list               — list workflow templates");
+    println!("  /workflow run <name> <task>  — run a named template");
+    println!("  /history [query]             — recall past agent results");
+    println!("  /memory <text>               — store a CLS memory");
+    println!("  /dream                       — run dream consolidation");
     println!("{}", "─".repeat(50));
 
     // Boot the ActorSystem.
@@ -532,6 +582,12 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
         })).await?;
 
         agent_refs.insert(agent_id.to_string(), actor_ref);
+    }
+
+    // Register built-in workflow templates
+    {
+        let brain = brain_ref.lock().unwrap();
+        register_builtin_workflow_templates(&brain);
     }
 
     println!("Agents online: gsea-main, gsea-coder, gsea-reviewer, gsea-tester");
@@ -626,6 +682,12 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                                         task_id,
                                         result: serde_json::json!({ "response": &text[..text.len().min(500)] }),
                                     }).await?;
+                                    // Store result in Brain for cross-session memory sharing
+                                    if let Ok(mut brain) = brain_ref.lock() {
+                                        let _ = brain.store_agent_result(
+                                            target, task_desc, &text[..text.len().min(2000)], None,
+                                        );
+                                    }
                                 }
                                 Ok(Err(e)) => {
                                     eprintln!("[{}] Error: {}", target, e);
@@ -644,15 +706,118 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                         }
                         continue;
                     }
-                    cmd if cmd.starts_with("/workflow ") => {
-                        let task_desc = cmd.trim_start_matches("/workflow ").trim();
-                        if task_desc.is_empty() {
-                            println!("Usage: /workflow <task description>");
-                            println!("  Runs: coder → reviewer → tester pipeline");
+                    cmd if cmd.starts_with("/workflow") => {
+                        let rest = cmd.trim_start_matches("/workflow").trim();
+                        if rest.is_empty() {
+                            println!("Usage:");
+                            println!("  /workflow <task>             — run default pipeline (coder→reviewer→tester)");
+                            println!("  /workflow list               — list available templates");
+                            println!("  /workflow run <name> <task>  — run a named template");
+                            println!("  /workflow save <name> <desc> — save current pipeline as template");
                             continue;
                         }
 
-                        run_workflow(task_desc, &agent_refs, &orch_ref).await?;
+                        if rest == "list" {
+                            let brain = brain_ref.lock().unwrap();
+                            let templates = brain.list_workflow_templates();
+                            if templates.is_empty() {
+                                println!("No workflow templates found.");
+                            } else {
+                                println!("Workflow templates:");
+                                for (name, desc) in &templates {
+                                    println!("  {} — {}", name, desc);
+                                }
+                            }
+                            continue;
+                        }
+
+                        if rest.starts_with("run ") {
+                            let run_rest = rest.trim_start_matches("run ").trim();
+                            let parts: Vec<&str> = run_rest.splitn(2, ' ').collect();
+                            if parts.len() < 2 {
+                                println!("Usage: /workflow run <template-name> <task description>");
+                                continue;
+                            }
+                            let template_name = parts[0];
+                            let task_desc = parts[1];
+
+                            let template = {
+                                let brain = brain_ref.lock().unwrap();
+                                brain.get_workflow_template(template_name)
+                            };
+
+                            if let Some((_desc, steps_json)) = template {
+                                run_template_workflow(
+                                    template_name, task_desc, &steps_json,
+                                    &agent_refs, &orch_ref, &brain_ref,
+                                ).await?;
+                            } else {
+                                println!("Unknown template: {}", template_name);
+                                let brain = brain_ref.lock().unwrap();
+                                let templates = brain.list_workflow_templates();
+                                if !templates.is_empty() {
+                                    println!("Available: {}", templates.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "));
+                                }
+                            }
+                            continue;
+                        }
+
+                        if rest.starts_with("save ") {
+                            let save_rest = rest.trim_start_matches("save ").trim();
+                            let parts: Vec<&str> = save_rest.splitn(2, ' ').collect();
+                            if parts.len() < 2 {
+                                println!("Usage: /workflow save <name> <description>");
+                                println!("  Saves the default coder→reviewer→tester pipeline as a named template.");
+                                continue;
+                            }
+                            let name = parts[0];
+                            let desc = parts[1];
+                            let default_steps = r#"[
+                                {"step_id":"code","agent":"gsea-coder","prompt_template":"Implement the following:\n\nTask: {task}"},
+                                {"step_id":"review","agent":"gsea-reviewer","prompt_template":"Review the code below:\n\nOriginal task: {task}\n\n--- Coder's output ---\n{prev_output}\n--- End ---"},
+                                {"step_id":"test","agent":"gsea-tester","prompt_template":"Write tests:\n\nOriginal task: {task}\n\n--- Implementation ---\n{all_outputs}\n--- End ---"}
+                            ]"#;
+                            let brain = brain_ref.lock().unwrap();
+                            match brain.store_workflow_template(name, desc, default_steps) {
+                                Ok(_) => println!("Template '{}' saved.", name),
+                                Err(e) => eprintln!("Failed to save template: {}", e),
+                            }
+                            continue;
+                        }
+
+                        // Default: run the built-in coder→reviewer→tester pipeline
+                        run_workflow(rest, &agent_refs, &orch_ref, &brain_ref).await?;
+                        continue;
+                    }
+                    cmd if cmd.starts_with("/history") => {
+                        let query = cmd.trim_start_matches("/history").trim();
+                        let brain = brain_ref.lock().unwrap();
+                        let results = if query.is_empty() {
+                            brain.recall_agent_results("", 10)
+                        } else {
+                            brain.recall_agent_results(query, 10)
+                        };
+                        if results.is_empty() {
+                            println!("No agent results found.");
+                        } else {
+                            println!("Past agent results ({}):", results.len());
+                            for item in &results {
+                                // Parse AGENT_RESULT:agent|workflow|task header
+                                let first_line = item.content.lines().next().unwrap_or("");
+                                if let Some(rest) = first_line.strip_prefix("AGENT_RESULT:") {
+                                    let parts: Vec<&str> = rest.splitn(3, '|').collect();
+                                    if parts.len() == 3 {
+                                        println!("  [{}] {} — {}", parts[0], parts[2], item.created_at);
+                                        let body: String = item.content.lines().skip(1).take(3).collect::<Vec<_>>().join("\n");
+                                        if !body.is_empty() {
+                                            let preview: String = body.chars().take(200).collect();
+                                            println!("    {}", preview);
+                                        }
+                                    }
+                                }
+                                println!();
+                            }
+                        }
                         continue;
                     }
                     cmd if cmd.starts_with("/memory ") => {
@@ -696,6 +861,12 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                                     Ok(Ok(del_text)) => {
                                         println!("\n[{}] {}", target, del_text);
                                         println!();
+                                        // Store auto-delegated result in Brain
+                                        if let Ok(mut brain) = brain_ref.lock() {
+                                            let _ = brain.store_agent_result(
+                                                &target, &task, &del_text[..del_text.len().min(2000)], None,
+                                            );
+                                        }
                                     }
                                     Ok(Err(e)) => eprintln!("[{}] Error: {}", target, e),
                                     Err(e) => eprintln!("[{}] Communication error: {}", target, e),
@@ -788,6 +959,7 @@ async fn run_workflow(
     task_desc: &str,
     agent_refs: &std::collections::HashMap<String, ActorRef<AgentMessage>>,
     orch_ref: &ActorRef<OrchestratorMessage>,
+    brain_ref: &Arc<std::sync::Mutex<Brain>>,
 ) -> Result<()> {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("Workflow: coder → reviewer → tester");
@@ -920,12 +1092,23 @@ async fn run_workflow(
                 if text.len() > 2000 {
                     println!("... ({} chars total)", text.len());
                 }
-                step_outputs.push(text);
 
                 orch_ref.tell(OrchestratorMessage::CompleteTask {
                     task_id,
                     result: serde_json::json!({ "status": "ok" }),
                 }).await?;
+
+                // Store step result in Brain for cross-session memory sharing
+                if let Ok(mut brain) = brain_ref.lock() {
+                    let _ = brain.store_agent_result(
+                        agent_id,
+                        &format!("[{}] {}", label, task_desc),
+                        &text[..text.len().min(2000)],
+                        Some(&workflow_id.to_string()),
+                    );
+                }
+
+                step_outputs.push(text);
             }
             Ok(Err(e)) => {
                 eprintln!("[{}] Error: {}", agent_id, e);
@@ -956,6 +1139,149 @@ async fn run_workflow(
         println!("  reviewer: {} chars", step_outputs.get(1).map(|s| s.len()).unwrap_or(0));
         println!("  tester:   {} chars", step_outputs.get(2).map(|s| s.len()).unwrap_or(0));
     }
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    Ok(())
+}
+
+/// Execute a named workflow template loaded from Brain.
+///
+/// Template steps are stored as JSON:
+/// ```json
+/// [
+///   {"step_id": "code", "agent": "gsea-coder", "prompt_template": "...{task}...{prev_output}...{all_outputs}..."},
+///   ...
+/// ]
+/// ```
+///
+/// Placeholder variables in `prompt_template`:
+///   - `{task}` — the user's task description
+///   - `{prev_output}` — the previous step's output
+///   - `{all_outputs}` — all previous steps' outputs concatenated
+async fn run_template_workflow(
+    template_name: &str,
+    task_desc: &str,
+    steps_json: &str,
+    agent_refs: &std::collections::HashMap<String, ActorRef<AgentMessage>>,
+    orch_ref: &ActorRef<OrchestratorMessage>,
+    brain_ref: &Arc<std::sync::Mutex<Brain>>,
+) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct TemplateStep {
+        step_id: String,
+        agent: String,
+        prompt_template: String,
+    }
+
+    let steps: Vec<TemplateStep> = serde_json::from_str(steps_json)
+        .map_err(|e| anyhow::anyhow!("Invalid template JSON: {}", e))?;
+
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Template: {} ({} steps)", template_name, steps.len());
+    println!("Task: {}", task_desc);
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    let workflow_id = uuid::Uuid::new_v4();
+
+    let mut step_outputs: Vec<String> = Vec::new();
+    let mut failed = false;
+    let total = steps.len();
+
+    for (i, step) in steps.iter().enumerate() {
+        let label = format!("Step {}/{}: {} ({})", i + 1, total, step.step_id, step.agent);
+        println!("\n── {} ──────────────────────────────────", label);
+
+        let agent_ref = match agent_refs.get(&step.agent) {
+            Some(r) => r,
+            None => {
+                eprintln!("Agent {} not found, aborting workflow", step.agent);
+                failed = true;
+                break;
+            }
+        };
+
+        // Build prompt from template
+        let prev_output = step_outputs.last().cloned().unwrap_or_default();
+        let all_outputs = step_outputs.iter().enumerate()
+            .map(|(j, o)| format!("--- Step {} output ---\n{}", j + 1, o))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let prompt = step.prompt_template
+            .replace("{task}", task_desc)
+            .replace("{prev_output}", &prev_output)
+            .replace("{all_outputs}", &all_outputs);
+
+        // Submit task to orchestrator
+        let task_id = uuid::Uuid::new_v4();
+        orch_ref.tell(OrchestratorMessage::SubmitTask(AgentTask {
+            task_id,
+            description: format!("{}: {}", label, &task_desc[..task_desc.len().min(60)]),
+            input: serde_json::json!({ "prompt": &prompt[..prompt.len().min(200)] }),
+            priority: TaskPriority::Normal,
+            timeout_ms: 120_000,
+        })).await?;
+
+        // Send to agent
+        let query = make_query(&prompt);
+        let response = agent_ref.ask(
+            |reply_tx| AgentMessage::QueryWithReply(query, reply_tx),
+            std::time::Duration::from_secs(120),
+        ).await;
+
+        match response {
+            Ok(Ok(text)) => {
+                let display: String = text.chars().take(2000).collect();
+                println!("{}", display);
+                if text.len() > 2000 {
+                    println!("... ({} chars total)", text.len());
+                }
+
+                orch_ref.tell(OrchestratorMessage::CompleteTask {
+                    task_id,
+                    result: serde_json::json!({ "status": "ok" }),
+                }).await?;
+
+                // Store in Brain for memory sharing
+                if let Ok(mut brain) = brain_ref.lock() {
+                    let _ = brain.store_agent_result(
+                        &step.agent,
+                        &format!("[{}/{}] {}", template_name, step.step_id, task_desc),
+                        &text[..text.len().min(2000)],
+                        Some(&workflow_id.to_string()),
+                    );
+                }
+
+                step_outputs.push(text);
+            }
+            Ok(Err(e)) => {
+                eprintln!("[{}] Error: {}", step.agent, e);
+                orch_ref.tell(OrchestratorMessage::FailTask {
+                    task_id,
+                    error: e,
+                }).await?;
+                failed = true;
+                break;
+            }
+            Err(e) => {
+                eprintln!("[{}] Communication error: {}", step.agent, e);
+                failed = true;
+                break;
+            }
+        }
+    }
+
+    // Summary
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    if failed {
+        println!("Template '{}' FAILED ({}/{} steps)", template_name, step_outputs.len(), total);
+    } else {
+        println!("Template '{}' COMPLETED ({}/{} steps)", template_name, step_outputs.len(), total);
+        for (i, step) in steps.iter().enumerate() {
+            println!("  {}: {} chars", step.step_id, step_outputs.get(i).map(|s| s.len()).unwrap_or(0));
+        }
+    }
+    println!("Workflow ID: {}", workflow_id);
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     Ok(())
