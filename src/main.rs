@@ -2011,6 +2011,21 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
         let mon_model_name = cli.model.clone();
         let mon_fast_model = cli.fast_model.clone();
         tokio::spawn(async move {
+            // Cache last known LLM stats so graph doesn't disappear when agent is busy
+            let mut cached_llm: Vec<monitoring_core::LlmBackendSnapshot> = vec![
+                monitoring_core::LlmBackendSnapshot {
+                    name: "Main LLM".to_string(),
+                    model: mon_model_name.clone(),
+                    cb_state: monitoring_core::CBState::Closed,
+                    total_calls: 0, failure_count: 0, avg_latency_ms: 0.0,
+                },
+                monitoring_core::LlmBackendSnapshot {
+                    name: "Fast LLM".to_string(),
+                    model: mon_fast_model.clone(),
+                    cb_state: monitoring_core::CBState::Closed,
+                    total_calls: 0, failure_count: 0, avg_latency_ms: 0.0,
+                },
+            ];
             loop {
                 // Update agent states from live stats
                 for agent_id in &agent_arcs_ids {
@@ -2042,38 +2057,31 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                 let mut snap = monitor_ref.collect();
                 snap.agents = agents_clone.snapshot();
 
-                // LLM backend snapshots from agent's OllamaClient
+                // LLM backend snapshots — update cache when agent is available
                 if let Some(ref main_arc) = mon_main_agent {
                     let guard = main_arc.lock().await;
                     if let Some(ref agent) = *guard {
-                        let cb_stats = agent.llm_circuit_stats();
-                        snap.llm_backends.push(monitoring_core::LlmBackendSnapshot {
-                            name: "Main LLM".to_string(),
-                            model: mon_model_name.clone(),
-                            cb_state: match cb_stats.state {
-                                pekko_actor::CircuitBreakerState::Closed => monitoring_core::CBState::Closed,
-                                pekko_actor::CircuitBreakerState::Open => monitoring_core::CBState::Open,
-                                pekko_actor::CircuitBreakerState::HalfOpen => monitoring_core::CBState::HalfOpen,
-                            },
-                            total_calls: cb_stats.total_calls,
-                            failure_count: cb_stats.failure_count,
-                            avg_latency_ms: 0.0,
-                        });
-                        let fast_cb = agent.fast_llm_circuit_stats();
-                        snap.llm_backends.push(monitoring_core::LlmBackendSnapshot {
-                            name: "Fast LLM".to_string(),
-                            model: mon_fast_model.clone(),
-                            cb_state: match fast_cb.state {
-                                pekko_actor::CircuitBreakerState::Closed => monitoring_core::CBState::Closed,
-                                pekko_actor::CircuitBreakerState::Open => monitoring_core::CBState::Open,
-                                pekko_actor::CircuitBreakerState::HalfOpen => monitoring_core::CBState::HalfOpen,
-                            },
-                            total_calls: fast_cb.total_calls,
-                            failure_count: fast_cb.failure_count,
-                            avg_latency_ms: 0.0,
-                        });
+                        let cb = agent.llm_circuit_stats();
+                        cached_llm[0].cb_state = match cb.state {
+                            pekko_actor::CircuitBreakerState::Closed => monitoring_core::CBState::Closed,
+                            pekko_actor::CircuitBreakerState::Open => monitoring_core::CBState::Open,
+                            pekko_actor::CircuitBreakerState::HalfOpen => monitoring_core::CBState::HalfOpen,
+                        };
+                        cached_llm[0].total_calls = cb.total_calls;
+                        cached_llm[0].failure_count = cb.failure_count;
+
+                        let fcb = agent.fast_llm_circuit_stats();
+                        cached_llm[1].cb_state = match fcb.state {
+                            pekko_actor::CircuitBreakerState::Closed => monitoring_core::CBState::Closed,
+                            pekko_actor::CircuitBreakerState::Open => monitoring_core::CBState::Open,
+                            pekko_actor::CircuitBreakerState::HalfOpen => monitoring_core::CBState::HalfOpen,
+                        };
+                        cached_llm[1].total_calls = fcb.total_calls;
+                        cached_llm[1].failure_count = fcb.failure_count;
                     }
+                    // Agent busy (None) — use cached values
                 }
+                snap.llm_backends = cached_llm.clone();
 
                 // Inject tool list (local ToolRegistry has no execution stats)
                 if let Ok(reg) = registry_for_mon.lock() {
