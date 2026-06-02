@@ -2010,6 +2010,7 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
         let mon_main_agent = agent_arcs.get("gsea-coder").cloned();
         let mon_model_name = cli.model.clone();
         let mon_fast_model = cli.fast_model.clone();
+        let mon_brain = brain_ref.clone();
         tokio::spawn(async move {
             // Cache last known LLM stats so graph doesn't disappear when agent is busy
             let mut cached_llm: Vec<monitoring_core::LlmBackendSnapshot> = vec![
@@ -2082,6 +2083,20 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
                     // Agent busy (None) — use cached values
                 }
                 snap.llm_backends = cached_llm.clone();
+
+                // Brain memory stats
+                if let Ok(b) = mon_brain.lock() {
+                    let skills: Vec<String> = b.list_skills().into_iter().map(|(name, _)| name).collect();
+                    let workflows: Vec<String> = b.list_workflow_templates().into_iter().map(|(name, _)| name).collect();
+                    snap.brain = Some(monitoring_core::BrainSnapshot {
+                        working: b.working.len() as i64,
+                        episodic: b.episodic.count(),
+                        semantic: b.semantic.count(),
+                        procedural: b.procedural.count(),
+                        skills,
+                        workflows,
+                    });
+                }
 
                 // Inject tool list (local ToolRegistry has no execution stats)
                 if let Ok(reg) = registry_for_mon.lock() {
