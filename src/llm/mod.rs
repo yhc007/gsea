@@ -19,6 +19,8 @@ pub struct OllamaClient {
     client: reqwest::Client,
     /// Circuit breaker protecting the Ollama HTTP endpoint.
     cb: CircuitBreaker,
+    /// Generation options (temperature, top_p, etc.) — set via personality profiles.
+    options: Option<ChatOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +35,21 @@ struct ChatRequest {
     messages: Vec<Message>,
     stream: bool,
     tools: Option<Vec<ToolSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<ChatOptions>,
+}
+
+/// Ollama generation options (temperature, top_p, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_penalty: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,6 +87,7 @@ impl OllamaClient {
             model: model.to_string(),
             client: reqwest::Client::new(),
             cb,
+            options: None,
         }
     }
 
@@ -80,6 +98,16 @@ impl OllamaClient {
 
     pub fn model_name(&self) -> &str {
         &self.model
+    }
+
+    /// Set generation options (temperature, top_p, etc.)
+    pub fn set_options(&mut self, options: ChatOptions) {
+        self.options = Some(options);
+    }
+
+    /// Get current generation options.
+    pub fn options(&self) -> Option<&ChatOptions> {
+        self.options.as_ref()
     }
 
     /// Check whether the circuit breaker is currently open.
@@ -102,6 +130,7 @@ impl OllamaClient {
             messages,
             stream: false,
             tools: None,
+            options: self.options.clone(),
         };
 
         let result = self.cb.call(|| {
@@ -149,6 +178,7 @@ impl OllamaClient {
             messages,
             stream: false,
             tools: Some(tools),
+            options: self.options.clone(),
         };
 
         let result = self.cb.call(|| {
@@ -198,6 +228,7 @@ impl OllamaClient {
             messages,
             stream: true,
             tools: None,
+            options: self.options.clone(),
         };
 
         // Protect the initial connection with the circuit breaker

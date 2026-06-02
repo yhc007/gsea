@@ -17,6 +17,52 @@ use crate::tools::ToolRegistry;
 /// Tool call timeout in seconds.
 const TOOL_TIMEOUT_SECS: u64 = 60;
 
+/// Interval for resource change checks (seconds).
+const RESOURCE_POLL_SECS: u64 = 5;
+
+/// Tracks resource subscriptions from MCP clients.
+struct ResourceSubscriptions {
+    /// Set of subscribed resource URIs.
+    subscribed: std::collections::HashSet<String>,
+    /// Cached snapshots for change detection (uri -> last known value).
+    snapshots: std::collections::HashMap<String, String>,
+}
+
+impl ResourceSubscriptions {
+    fn new() -> Self {
+        Self {
+            subscribed: std::collections::HashSet::new(),
+            snapshots: std::collections::HashMap::new(),
+        }
+    }
+
+    fn subscribe(&mut self, uri: &str) {
+        self.subscribed.insert(uri.to_string());
+    }
+
+    fn unsubscribe(&mut self, uri: &str) {
+        self.subscribed.remove(uri);
+        self.snapshots.remove(uri);
+    }
+
+    fn is_subscribed(&self, uri: &str) -> bool {
+        self.subscribed.contains(uri)
+    }
+
+    fn subscribed_uris(&self) -> Vec<String> {
+        self.subscribed.iter().cloned().collect()
+    }
+
+    /// Check if a resource has changed since last snapshot. Returns true if changed.
+    fn check_changed(&mut self, uri: &str, current_value: &str) -> bool {
+        let changed = self.snapshots.get(uri).map_or(true, |prev| prev != current_value);
+        if changed {
+            self.snapshots.insert(uri.to_string(), current_value.to_string());
+        }
+        changed
+    }
+}
+
 /// Run the MCP server: reads JSON-RPC requests from stdin, writes responses to stdout.
 pub async fn run_mcp_server(
     tools: Arc<std::sync::Mutex<ToolRegistry>>,
@@ -26,9 +72,22 @@ pub async fn run_mcp_server(
 ) -> Result<()> {
     let mut line_buf = String::new();
     let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let subs = Arc::new(std::sync::Mutex::new(ResourceSubscriptions::new()));
 
     // Log server startup
     log_notification("info", "GSEA MCP server starting").await;
+
+    // Spawn resource change monitor
+    {
+        let brain_clone = brain.clone();
+        let subs_clone = subs.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(RESOURCE_POLL_SECS)).await;
+                check_resource_changes(&brain_clone, &subs_clone).await;
+            }
+        });
+    }
 
     loop {
         line_buf.clear();
@@ -57,7 +116,7 @@ pub async fn run_mcp_server(
             continue;
         }
 
-        let response = handle_request(&request, &tools, &brain, &agent, &llm).await;
+        let response = handle_request(&request, &tools, &brain, &agent, &llm, &subs).await;
         let _ = writeln_json(&response).await;
     }
 
@@ -201,6 +260,7 @@ async fn handle_request(
     brain: &Arc<std::sync::Mutex<Brain>>,
     agent: &Option<Arc<tokio::sync::Mutex<Agent>>>,
     llm: &Option<OllamaClient>,
+    subs: &Arc<std::sync::Mutex<ResourceSubscriptions>>,
 ) -> RpcResponse {
     match req.method.as_str() {
         "initialize" => handle_initialize(req),
@@ -209,9 +269,11 @@ async fn handle_request(
         "tools/call" => handle_tools_call(req, tools, brain, agent, llm).await,
         "resources/list" => handle_resources_list(req, brain),
         "resources/read" => handle_resources_read(req, brain),
+        "resources/subscribe" => handle_resources_subscribe(req, subs),
+        "resources/unsubscribe" => handle_resources_unsubscribe(req, subs),
         "resources/templates/list" => handle_resource_templates(req),
         "prompts/list" => handle_prompts_list(req),
-        "prompts/get" => handle_prompts_get(req),
+        "prompts/get" => handle_prompts_get(req, brain),
         "logging/setLevel" => handle_set_log_level(req),
         "ping" => rpc_result(req.id.clone(), serde_json::json!({})),
         "shutdown" | "exit" => {
@@ -295,13 +357,62 @@ fn handle_tools_list(req: &RpcRequest, tools: &Arc<std::sync::Mutex<ToolRegistry
         }
     }));
 
+    // Add multi-agent tools
+    tool_list.push(serde_json::json!({
+        "name": "agent_health",
+        "description": "Check the health status of all GSEA agents. Returns status (healthy/degraded/unhealthy) for each agent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        }
+    }));
+
+    tool_list.push(serde_json::json!({
+        "name": "brain_search",
+        "description": "Search the GSEA MemoryBrain for stored knowledge, agent results, and learned skills.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query for memory recall"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results (default: 10)"
+                }
+            },
+            "required": ["query"]
+        }
+    }));
+
+    tool_list.push(serde_json::json!({
+        "name": "store_memory",
+        "description": "Store a piece of information in the GSEA MemoryBrain for later recall.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The content to store"
+                },
+                "memory_type": {
+                    "type": "string",
+                    "description": "Type of memory: semantic, episodic, or procedural",
+                    "enum": ["semantic", "episodic", "procedural"]
+                }
+            },
+            "required": ["content"]
+        }
+    }));
+
     rpc_result(req.id.clone(), serde_json::json!({ "tools": tool_list }))
 }
 
 async fn handle_tools_call(
     req: &RpcRequest,
     tools: &Arc<std::sync::Mutex<ToolRegistry>>,
-    _brain: &Arc<std::sync::Mutex<Brain>>,
+    brain: &Arc<std::sync::Mutex<Brain>>,
     agent: &Option<Arc<tokio::sync::Mutex<Agent>>>,
     llm: &Option<OllamaClient>,
 ) -> RpcResponse {
@@ -317,10 +428,13 @@ async fn handle_tools_call(
 
     let arguments = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
 
-    // Built-in tools: chat and query
+    // Built-in tools: chat, query, and multi-agent
     match tool_name {
         "chat" => return handle_chat_tool(req, &arguments, agent).await,
         "query" => return handle_query_tool(req, &arguments, llm).await,
+        "agent_health" => return handle_agent_health_tool(req, brain),
+        "brain_search" => return handle_brain_search_tool(req, &arguments, brain),
+        "store_memory" => return handle_store_memory_tool(req, &arguments, brain),
         _ => {}
     }
 
@@ -430,6 +544,84 @@ async fn handle_query_tool(
     }
 }
 
+/// Handle the `agent_health` tool — returns brain stats as a health proxy.
+fn handle_agent_health_tool(
+    req: &RpcRequest,
+    brain: &Arc<std::sync::Mutex<Brain>>,
+) -> RpcResponse {
+    let b = brain.lock().unwrap();
+    let stats = b.stats();
+    let skills = b.list_skills();
+    let recent = b.recall("", 5);
+
+    let result = serde_json::json!({
+        "brain_stats": stats,
+        "skills_count": skills.len(),
+        "recent_memories": recent.len(),
+        "status": "operational",
+    });
+
+    tool_result(req.id.clone(), &result, false)
+}
+
+/// Handle the `brain_search` tool — search memories.
+fn handle_brain_search_tool(
+    req: &RpcRequest,
+    arguments: &Value,
+    brain: &Arc<std::sync::Mutex<Brain>>,
+) -> RpcResponse {
+    let query = match arguments.get("query").and_then(|v| v.as_str()) {
+        Some(q) => q,
+        None => return rpc_error(req.id.clone(), -32602, "Missing 'query' argument"),
+    };
+    let limit = arguments.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    let b = brain.lock().unwrap();
+    let results = b.recall(query, limit);
+    let items: Vec<Value> = results.iter().map(|item| {
+        serde_json::json!({
+            "id": item.id.to_string(),
+            "content": item.content,
+            "type": format!("{}", item.memory_type),
+            "strength": item.strength,
+            "created_at": item.created_at.to_string(),
+        })
+    }).collect();
+
+    tool_result(req.id.clone(), &serde_json::json!({
+        "results": items,
+        "count": items.len(),
+        "query": query,
+    }), false)
+}
+
+/// Handle the `store_memory` tool — store content in brain.
+fn handle_store_memory_tool(
+    req: &RpcRequest,
+    arguments: &Value,
+    brain: &Arc<std::sync::Mutex<Brain>>,
+) -> RpcResponse {
+    let content = match arguments.get("content").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return rpc_error(req.id.clone(), -32602, "Missing 'content' argument"),
+    };
+
+    let mtype = match arguments.get("memory_type").and_then(|v| v.as_str()) {
+        Some("episodic") => crate::memory_brain::MemoryType::Episodic,
+        Some("procedural") => crate::memory_brain::MemoryType::Procedural,
+        _ => crate::memory_brain::MemoryType::Semantic,
+    };
+
+    let mut b = brain.lock().unwrap();
+    match b.process(content, Some(mtype)) {
+        Ok(id) => tool_result(req.id.clone(), &serde_json::json!({
+            "id": id.to_string(),
+            "status": "stored",
+        }), false),
+        Err(e) => tool_result_error(req.id.clone(), &format!("Store failed: {}", e)),
+    }
+}
+
 /// Build a successful tool result with proper MCP content format.
 fn tool_result(id: Option<Value>, value: &Value, is_error: bool) -> RpcResponse {
     let text = match value {
@@ -490,6 +682,24 @@ fn handle_resource_templates(req: &RpcRequest) -> RpcResponse {
                 "uriTemplate": "memory://brain/search/{query}",
                 "name": "Search Memories",
                 "description": "Search brain memories by keyword",
+                "mimeType": "application/json"
+            },
+            {
+                "uriTemplate": "memory://agent/{name}/stats",
+                "name": "Agent Stats",
+                "description": "Get performance stats for a specific agent",
+                "mimeType": "application/json"
+            },
+            {
+                "uriTemplate": "memory://agent/{name}/skills",
+                "name": "Agent Skills",
+                "description": "List skills learned by a specific agent",
+                "mimeType": "application/json"
+            },
+            {
+                "uriTemplate": "memory://brain/type/{memory_type}",
+                "name": "Memories by Type",
+                "description": "List memories of a specific type (episodic, semantic, procedural)",
                 "mimeType": "application/json"
             }
         ]
@@ -572,6 +782,71 @@ fn handle_resources_read(req: &RpcRequest, brain: &Arc<std::sync::Mutex<Brain>>)
                 }]
             }))
         }
+        _ if uri.starts_with("memory://agent/") && uri.ends_with("/stats") => {
+            let name = uri.trim_start_matches("memory://agent/").trim_end_matches("/stats");
+            // Return agent results from brain as stats proxy
+            let results = b.recall_agent_results(name, 5);
+            let items: Vec<Value> = results.iter().map(|item| {
+                serde_json::json!({
+                    "id": item.id,
+                    "content": item.content.chars().take(200).collect::<String>(),
+                    "strength": item.strength,
+                })
+            }).collect();
+            rpc_result(req.id.clone(), serde_json::json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": serde_json::to_string_pretty(&serde_json::json!({
+                        "agent": name,
+                        "result_count": items.len(),
+                        "results": items,
+                    })).unwrap_or_default()
+                }]
+            }))
+        }
+        _ if uri.starts_with("memory://agent/") && uri.ends_with("/skills") => {
+            let name = uri.trim_start_matches("memory://agent/").trim_end_matches("/skills");
+            let skills = b.list_skills();
+            let agent_skills: Vec<_> = skills.iter()
+                .filter(|(_, desc)| desc.to_lowercase().contains(&name.to_lowercase()))
+                .collect();
+            let text = if agent_skills.is_empty() {
+                format!("No skills specifically for agent '{}'.\nAll skills:\n{}", name,
+                    skills.iter().map(|(n, d)| format!("- {}: {}", n, d)).collect::<Vec<_>>().join("\n"))
+            } else {
+                agent_skills.iter().map(|(n, d)| format!("- {}: {}", n, d)).collect::<Vec<_>>().join("\n")
+            };
+            rpc_result(req.id.clone(), serde_json::json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "text/plain",
+                    "text": text
+                }]
+            }))
+        }
+        _ if uri.starts_with("memory://brain/type/") => {
+            let memory_type = uri.trim_start_matches("memory://brain/type/");
+            let results = b.recall(memory_type, 20);
+            let items: Vec<Value> = results.iter()
+                .filter(|item| format!("{}", item.memory_type).to_lowercase() == memory_type.to_lowercase())
+                .take(10)
+                .map(|item| {
+                    serde_json::json!({
+                        "id": item.id,
+                        "type": format!("{}", item.memory_type),
+                        "content": item.content.chars().take(200).collect::<String>(),
+                        "strength": item.strength,
+                    })
+                }).collect();
+            rpc_result(req.id.clone(), serde_json::json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": serde_json::to_string_pretty(&items).unwrap_or_default()
+                }]
+            }))
+        }
         _ => rpc_error(req.id.clone(), -32602, &format!("Resource not found: {}", uri)),
     }
 }
@@ -599,12 +874,34 @@ fn handle_prompts_list(req: &RpcRequest) -> RpcResponse {
                 "name": "reflect",
                 "description": "Run a self-evolution reflection cycle to identify improvements",
                 "arguments": []
+            },
+            {
+                "name": "debug_session",
+                "description": "Start a debugging session with recent errors and context from memory",
+                "arguments": [
+                    { "name": "component", "description": "Component or module to focus on", "required": false }
+                ]
+            },
+            {
+                "name": "architecture_review",
+                "description": "Review system architecture using skills and patterns from memory",
+                "arguments": [
+                    { "name": "focus", "description": "Area to focus on (e.g. 'performance', 'security')", "required": false }
+                ]
+            },
+            {
+                "name": "daily_summary",
+                "description": "Generate a summary of recent agent activity and learnings",
+                "arguments": []
             }
         ]
     }))
 }
 
-fn handle_prompts_get(req: &RpcRequest) -> RpcResponse {
+fn handle_prompts_get(
+    req: &RpcRequest,
+    brain: &Arc<std::sync::Mutex<Brain>>,
+) -> RpcResponse {
     let params = match &req.params {
         Some(p) => p,
         None => return rpc_error(req.id.clone(), -32602, "Missing params"),
@@ -653,6 +950,228 @@ fn handle_prompts_get(req: &RpcRequest) -> RpcResponse {
                 }]
             }))
         }
+        "debug_session" => {
+            let component = args.get("component").and_then(|v| v.as_str()).unwrap_or("");
+            // Pull recent memories for error context
+            let recent_context = if let Ok(brain) = brain.lock() {
+                let query = if component.is_empty() { "error failure bug" } else { component };
+                let memories = brain.recall(query, 5);
+                if !memories.is_empty() {
+                    let ctx = memories.iter()
+                        .map(|m| {
+                            let c = &m.content;
+                            format!("- {}", &c[..c.len().min(200)])
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("\n\nRelevant memories from brain:\n{}", ctx)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            let focus = if component.is_empty() {
+                String::new()
+            } else {
+                format!(" Focus on the '{}' component.", component)
+            };
+
+            rpc_result(req.id.clone(), serde_json::json!({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!(
+                                "Start a debugging session.{}{}\n\n\
+                                 Steps:\n\
+                                 1. Identify the error or unexpected behavior\n\
+                                 2. Check recent changes and memory for related patterns\n\
+                                 3. Form a hypothesis\n\
+                                 4. Suggest a fix with test coverage",
+                                focus, recent_context
+                            )
+                        }
+                    }
+                ]
+            }))
+        }
+        "architecture_review" => {
+            let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("general");
+            // Pull skills and patterns from brain
+            let skills_context = if let Ok(brain) = brain.lock() {
+                let skills = brain.list_skills();
+                if skills.is_empty() {
+                    String::new()
+                } else {
+                    let list = skills.iter()
+                        .take(10)
+                        .map(|(name, desc)| format!("- {}: {}", name, desc))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("\n\nKnown skills/patterns:\n{}", list)
+                }
+            } else {
+                String::new()
+            };
+
+            rpc_result(req.id.clone(), serde_json::json!({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!(
+                                "Conduct an architecture review with focus on: {}.{}\n\n\
+                                 Evaluate:\n\
+                                 1. Component boundaries and responsibilities\n\
+                                 2. Data flow and coupling\n\
+                                 3. Error handling and resilience patterns\n\
+                                 4. Scalability considerations\n\
+                                 5. Recommendations for improvement",
+                                focus, skills_context
+                            )
+                        }
+                    }
+                ]
+            }))
+        }
+        "daily_summary" => {
+            // Pull recent activity from brain
+            let activity_context = if let Ok(brain) = brain.lock() {
+                let memories = brain.recall("recent activity summary", 10);
+                if !memories.is_empty() {
+                    let ctx = memories.iter()
+                        .map(|m| {
+                            let c = &m.content;
+                            format!("- {}", &c[..c.len().min(150)])
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("\n\nRecent activity from memory:\n{}", ctx)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            rpc_result(req.id.clone(), serde_json::json!({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!(
+                                "Generate a daily summary report.{}\n\n\
+                                 Include:\n\
+                                 1. Tasks completed and key outcomes\n\
+                                 2. Skills learned or improved\n\
+                                 3. Notable patterns or recurring issues\n\
+                                 4. Recommendations for tomorrow",
+                                activity_context
+                            )
+                        }
+                    }
+                ]
+            }))
+        }
         _ => rpc_error(req.id.clone(), -32602, &format!("Prompt not found: {}", name)),
+    }
+}
+
+// ─── Resource Subscriptions ───────────────────────────────────
+
+fn handle_resources_subscribe(
+    req: &RpcRequest,
+    subs: &Arc<std::sync::Mutex<ResourceSubscriptions>>,
+) -> RpcResponse {
+    let params = match &req.params {
+        Some(p) => p,
+        None => return rpc_error(req.id.clone(), -32602, "Missing params"),
+    };
+
+    let uri = match params.get("uri").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return rpc_error(req.id.clone(), -32602, "Missing uri"),
+    };
+
+    // Validate it's a known resource URI
+    let valid_uris = ["memory://brain/stats", "memory://skills", "memory://brain/recent"];
+    let is_valid = valid_uris.contains(&uri) || uri.starts_with("memory://brain/search/");
+
+    if !is_valid {
+        return rpc_error(req.id.clone(), -32602, &format!("Unknown resource: {}", uri));
+    }
+
+    subs.lock().unwrap().subscribe(uri);
+    tracing::info!("Resource subscribed: {}", uri);
+    rpc_result(req.id.clone(), serde_json::json!({}))
+}
+
+fn handle_resources_unsubscribe(
+    req: &RpcRequest,
+    subs: &Arc<std::sync::Mutex<ResourceSubscriptions>>,
+) -> RpcResponse {
+    let params = match &req.params {
+        Some(p) => p,
+        None => return rpc_error(req.id.clone(), -32602, "Missing params"),
+    };
+
+    let uri = match params.get("uri").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return rpc_error(req.id.clone(), -32602, "Missing uri"),
+    };
+
+    subs.lock().unwrap().unsubscribe(uri);
+    tracing::info!("Resource unsubscribed: {}", uri);
+    rpc_result(req.id.clone(), serde_json::json!({}))
+}
+
+/// Periodically check subscribed resources for changes and send notifications.
+async fn check_resource_changes(
+    brain: &Arc<std::sync::Mutex<Brain>>,
+    subs: &Arc<std::sync::Mutex<ResourceSubscriptions>>,
+) {
+    let uris = subs.lock().unwrap().subscribed_uris();
+    if uris.is_empty() {
+        return;
+    }
+
+    // Collect changed URIs while holding locks, then notify without locks
+    let changed_uris: Vec<String> = {
+        let b = brain.lock().unwrap();
+        let mut changed = Vec::new();
+
+        for uri in &uris {
+            let current_value = match uri.as_str() {
+                "memory://brain/stats" => {
+                    serde_json::to_string(&b.stats()).unwrap_or_default()
+                }
+                "memory://skills" => {
+                    let skills = b.list_skills();
+                    skills.iter().map(|(n, d)| format!("{}:{}", n, d)).collect::<Vec<_>>().join("|")
+                }
+                "memory://brain/recent" => {
+                    let recent = b.recall("", 10);
+                    recent.iter().map(|m| m.id.to_string()).collect::<Vec<_>>().join(",")
+                }
+                _ => continue,
+            };
+
+            if subs.lock().unwrap().check_changed(uri, &current_value) {
+                changed.push(uri.clone());
+            }
+        }
+        changed
+    }; // brain lock dropped here
+
+    // Send notifications without holding any locks
+    for uri in &changed_uris {
+        send_notification("notifications/resources/updated", serde_json::json!({
+            "uri": uri,
+        })).await;
     }
 }

@@ -164,6 +164,21 @@ impl Agent {
         self.messages.len()
     }
 
+    /// Export conversation history for serialization.
+    pub fn export_messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Import conversation history (replaces current messages).
+    pub fn import_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+    }
+
+    /// Check if the LLM circuit breaker is open (unhealthy).
+    pub fn llm_circuit_open(&self) -> bool {
+        self.llm.is_circuit_open()
+    }
+
     /// Process a message using the fast model (qwen3:8b).
     /// Used by EvolutionEngine for self-review and code generation.
     pub async fn process_message_fast(&mut self, prompt: &str) -> Result<String> {
@@ -276,6 +291,14 @@ When you're done, provide a final response to the user."#,
                 first.content = prompt.to_string();
             }
         }
+    }
+
+    /// Get the current system prompt.
+    pub fn get_system_prompt(&self) -> String {
+        self.messages.first()
+            .filter(|m| m.role == "system")
+            .map(|m| m.content.clone())
+            .unwrap_or_default()
     }
 
     /// Check whether an error is a circuit breaker error (open or timeout).
@@ -674,4 +697,56 @@ describe the exact code changes needed."#,
 struct ToolCall {
     name: String,
     params: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_needs_complex_model_simple_greetings() {
+        assert!(!Agent::needs_complex_model("hi"));
+        assert!(!Agent::needs_complex_model("hello"));
+        assert!(!Agent::needs_complex_model("thanks"));
+        assert!(!Agent::needs_complex_model("ok"));
+        assert!(!Agent::needs_complex_model("yes"));
+    }
+
+    #[test]
+    fn test_needs_complex_model_code_keywords() {
+        assert!(Agent::needs_complex_model("impl the retry function"));
+        assert!(Agent::needs_complex_model("refactor the module"));
+        assert!(Agent::needs_complex_model("run cargo build"));
+        assert!(Agent::needs_complex_model("debug this error"));
+    }
+
+    #[test]
+    fn test_needs_complex_model_code_blocks() {
+        assert!(Agent::needs_complex_model("Here:\n```rust\nfn foo() {}\n```"));
+    }
+
+    #[test]
+    fn test_needs_complex_model_goal_keywords() {
+        assert!(Agent::needs_complex_model("decompose this into sub-tasks"));
+        assert!(Agent::needs_complex_model("design the architecture"));
+        assert!(Agent::needs_complex_model("implement the feature"));
+    }
+
+    #[test]
+    fn test_needs_complex_model_long_input() {
+        let long = "a ".repeat(150);
+        assert!(Agent::needs_complex_model(&long));
+    }
+
+    #[test]
+    fn test_needs_complex_model_short_question() {
+        // Short non-greeting, non-technical → fast model
+        assert!(!Agent::needs_complex_model("what time is it?"));
+    }
+
+    #[test]
+    fn test_context_constants() {
+        assert!(CONTEXT_WINDOW_MAX > CONTEXT_WINDOW_KEEP);
+        assert!(CONTEXT_WINDOW_KEEP > 0);
+    }
 }

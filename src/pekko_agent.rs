@@ -66,6 +66,9 @@ pub struct GseaPekkoAgent {
     /// Event publisher — emits `AgentEventEnvelope` messages on every state
     /// transition so downstream consumers can observe the agent's FSM.
     pub events: EventPublisher,
+
+    /// Optional monitoring tracker — updated on every state transition.
+    pub monitor: Option<monitoring_bridge::AgentTracker>,
 }
 
 // ─── Constructor ─────────────────────────────────────────────────────────────
@@ -121,7 +124,13 @@ impl GseaPekkoAgent {
             agent: agent_arc,
             tool_defs,
             events: EventPublisher::new("agent-events", 100),
+            monitor: None,
         }
+    }
+
+    pub fn with_monitor(mut self, tracker: monitoring_bridge::AgentTracker) -> Self {
+        self.monitor = Some(tracker);
+        self
     }
 
     // ── Send-safe inner dispatch ───────────────────────────────────────────────
@@ -193,6 +202,17 @@ impl GseaPekkoAgent {
             to   = ?new_state,
             "State transition"
         );
+        if let Some(ref tracker) = self.monitor {
+            let label = match &new_state {
+                AgentState::Idle => monitoring_core::AgentStateLabel::Idle,
+                AgentState::Reasoning { .. } => monitoring_core::AgentStateLabel::Reasoning,
+                AgentState::Acting { .. } => monitoring_core::AgentStateLabel::Acting,
+                AgentState::Observing { .. } => monitoring_core::AgentStateLabel::Observing,
+                AgentState::Responding { .. } => monitoring_core::AgentStateLabel::Responding,
+                AgentState::Error { .. } => monitoring_core::AgentStateLabel::Error,
+            };
+            tracker.update_state(&self.id, label);
+        }
         self.state = new_state;
     }
 
@@ -245,6 +265,7 @@ impl Actor for GseaPekkoAgent {
                     session  = %query.session_id,
                     "Received Query"
                 );
+                if let Some(ref m) = self.monitor { m.record_received(&self.id); }
 
                 let correlation_id = query.session_id;
                 self.set_state(AgentState::Reasoning {
@@ -261,11 +282,13 @@ impl Actor for GseaPekkoAgent {
                             chars    = reply.len(),
                             "Query processed successfully"
                         );
+                        if let Some(ref m) = self.monitor { m.record_sent(&self.id); }
                         self.set_state(AgentState::Idle);
                         self.emit_state_event(correlation_id).await;
                     }
                     Err(e) => {
                         error!(agent_id = %self.id, error = %e, "Error processing query");
+                        if let Some(ref m) = self.monitor { m.record_error(&self.id); }
                         self.set_state(AgentState::Error {
                             error: e.to_string(),
                             recoverable: true,
@@ -282,6 +305,7 @@ impl Actor for GseaPekkoAgent {
                     session  = %query.session_id,
                     "Received QueryWithReply"
                 );
+                if let Some(ref m) = self.monitor { m.record_received(&self.id); }
 
                 let correlation_id = query.session_id;
                 self.set_state(AgentState::Reasoning {
@@ -298,12 +322,14 @@ impl Actor for GseaPekkoAgent {
                             chars    = reply.len(),
                             "QueryWithReply processed successfully"
                         );
+                        if let Some(ref m) = self.monitor { m.record_sent(&self.id); }
                         self.set_state(AgentState::Idle);
                         self.emit_state_event(correlation_id).await;
                         let _ = reply_tx.send(Ok(reply));
                     }
                     Err(e) => {
                         error!(agent_id = %self.id, error = %e, "Error processing query");
+                        if let Some(ref m) = self.monitor { m.record_error(&self.id); }
                         self.set_state(AgentState::Error {
                             error: e.to_string(),
                             recoverable: true,
@@ -578,6 +604,7 @@ mod tests {
             agent: Arc::new(Mutex::new(None)), // intentionally empty
             tool_defs: vec![],
             events: pekko_agent_events::EventPublisher::new("agent-events", 100),
+            monitor: None,
         }
     }
 

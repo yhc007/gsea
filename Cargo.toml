@@ -27,6 +27,8 @@ chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 eframe = "0.31"
 urlencoding = "2"
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
 
 # pekko-agent dependencies
 pekko-actor = { path = "../rust-pekko/pekko-actor" }
@@ -36,7 +38,12 @@ pekko-agent-memory = { path = "../pekko-agent/crates/pekko-agent-memory" }
 pekko-agent-tools = { path = "../pekko-agent/crates/pekko-agent-tools" }
 pekko-agent-orchestrator = { path = "../pekko-agent/crates/pekko-agent-orchestrator" }
 pekko-agent-events = { path = "../pekko-agent/crates/pekko-agent-events" }
+pekko-event-bus = { path = "../rust-pekko/pekko-event-bus" }
+
+# monitoring
+monitoring-core = { path = "../core-agent-monitoring/crates/monitoring-core" }
+monitoring-bridge = { path = "../core-agent-monitoring/crates/monitoring-bridge" }
+monitoring-exporter = { path = "../core-agent-monitoring/crates/monitoring-exporter" }
 
 [dev-dependencies]
 tempfile = "3"
-pekko-event-bus = { path = "../rust-pekko/pekko-event-bus" }
