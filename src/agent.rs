@@ -179,6 +179,14 @@ impl Agent {
         self.llm.is_circuit_open()
     }
 
+    pub fn llm_circuit_stats(&self) -> pekko_actor::CircuitBreakerStats {
+        self.llm.circuit_stats()
+    }
+
+    pub fn fast_llm_circuit_stats(&self) -> pekko_actor::CircuitBreakerStats {
+        self.fast_llm.circuit_stats()
+    }
+
     /// Process a message using the fast model (qwen3:8b).
     /// Used by EvolutionEngine for self-review and code generation.
     pub async fn process_message_fast(&mut self, prompt: &str) -> Result<String> {

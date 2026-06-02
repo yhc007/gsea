@@ -2007,6 +2007,9 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
         let agent_stats_ref = agent_stats.clone();
         let registry_for_mon = registry_ref.clone();
         let monitor_ref = monitor.clone();
+        let mon_main_agent = agent_arcs.get("gsea-coder").cloned();
+        let mon_model_name = cli.model.clone();
+        let mon_fast_model = cli.fast_model.clone();
         tokio::spawn(async move {
             loop {
                 // Update agent states from live stats
@@ -2038,6 +2041,39 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
 
                 let mut snap = monitor_ref.collect();
                 snap.agents = agents_clone.snapshot();
+
+                // LLM backend snapshots from agent's OllamaClient
+                if let Some(ref main_arc) = mon_main_agent {
+                    let guard = main_arc.lock().await;
+                    if let Some(ref agent) = *guard {
+                        let cb_stats = agent.llm_circuit_stats();
+                        snap.llm_backends.push(monitoring_core::LlmBackendSnapshot {
+                            name: "Main LLM".to_string(),
+                            model: mon_model_name.clone(),
+                            cb_state: match cb_stats.state {
+                                pekko_actor::CircuitBreakerState::Closed => monitoring_core::CBState::Closed,
+                                pekko_actor::CircuitBreakerState::Open => monitoring_core::CBState::Open,
+                                pekko_actor::CircuitBreakerState::HalfOpen => monitoring_core::CBState::HalfOpen,
+                            },
+                            total_calls: cb_stats.total_calls,
+                            failure_count: cb_stats.failure_count,
+                            avg_latency_ms: 0.0,
+                        });
+                        let fast_cb = agent.fast_llm_circuit_stats();
+                        snap.llm_backends.push(monitoring_core::LlmBackendSnapshot {
+                            name: "Fast LLM".to_string(),
+                            model: mon_fast_model.clone(),
+                            cb_state: match fast_cb.state {
+                                pekko_actor::CircuitBreakerState::Closed => monitoring_core::CBState::Closed,
+                                pekko_actor::CircuitBreakerState::Open => monitoring_core::CBState::Open,
+                                pekko_actor::CircuitBreakerState::HalfOpen => monitoring_core::CBState::HalfOpen,
+                            },
+                            total_calls: fast_cb.total_calls,
+                            failure_count: fast_cb.failure_count,
+                            avg_latency_ms: 0.0,
+                        });
+                    }
+                }
 
                 // Inject tool list (local ToolRegistry has no execution stats)
                 if let Ok(reg) = registry_for_mon.lock() {
