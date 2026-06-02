@@ -2059,11 +2059,16 @@ async fn run_pekko(agent: Agent, evolution: &mut EvolutionEngine) -> Result<()> 
         });
     }
     tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:9100").await
-            .expect("monitoring: failed to bind :9100");
-        axum::serve(listener, exporter.router()).await.ok();
+        match tokio::net::TcpListener::bind("0.0.0.0:9100").await {
+            Ok(listener) => {
+                println!("Monitoring exporter ready — http://localhost:9100");
+                axum::serve(listener, exporter.router()).await.ok();
+            }
+            Err(e) => {
+                eprintln!("Monitoring exporter: port 9100 unavailable ({}), skipping", e);
+            }
+        }
     });
-    println!("Monitoring exporter ready — http://localhost:9100");
 
     println!("{}", "─".repeat(50));
 
